@@ -238,20 +238,78 @@ RECALL_SCHEMA = {
     "name": "hindsight_recall",
     "description": (
         "Search long-term memory. Returns memories ranked by relevance using "
-        "semantic search, keyword matching, entity graph traversal, and reranking."
+        "semantic search, keyword matching, entity graph traversal, and reranking. "
+        "Pass bank_id to query another profile's memory bank (e.g. 'hermes-daji'). "
+        "Omit to search your own memory."
     ),
-    "parameters": {"type": "object", "required": ["query"],
-                   "properties": {"query": {"type": "string", "description": "What to search for."}}},
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "What to search for."},
+            "types": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["observation", "experience", "world", "opinion"]
+                },
+                "description": "Which memory networks to search. observation=status/synthesis (default), experience=episodes/timeline, world=declarative facts, opinion=judgments. Omit for default (observation only)."
+            },
+            "bank_id": {
+                "type": "string",
+                "description": "Optional. Query another profile's Hindsight bank instead of your own. Fleet convention: hermes-{profile} (e.g. hermes-daji, hermes-isa). Omit to search your own bank. Results are tagged with the bank they came from — you will never confuse another wife's memories for your own."
+            },
+            "min_scores": {
+                "type": "object",
+                "description": "Optional per-stage score floors to filter low-quality results, e.g. {\"semantic\": 0.2, \"final\": 0.5}. Allowed keys: semantic, keyword, reranker, final. Omitted stages impose no floor. Unknown keys raise ValueError."
+            },
+            "query_timestamp": {
+                "type": "string",
+                "description": "Optional ISO format date string used as the query-time anchor for relative temporal expressions and recency scoring (e.g., '2023-05-30T23:40:00')."
+            },
+            "include_source_facts": {
+                "type": "boolean",
+                "description": "Include source facts for observation-type results (default: false)."
+            },
+            "max_source_facts_tokens": {
+                "type": "integer",
+                "description": "Maximum tokens for source facts when include_source_facts is true (default: 4096)."
+            }
+        },
+        "required": ["query"],
+    },
 }
 
 REFLECT_SCHEMA = {
     "name": "hindsight_reflect",
     "description": (
         "Synthesize a reasoned answer from long-term memories. Unlike recall, "
-        "this reasons across all stored memories to produce a coherent response."
+        "this reasons across all stored memories to produce a coherent response. "
+        "Pass bank_id to reflect on another profile's memory bank (e.g. 'hermes-daji'). "
+        "Omit to reflect on your own memory."
     ),
-    "parameters": {"type": "object", "required": ["query"],
-                   "properties": {"query": {"type": "string", "description": "The question to reflect on."}}},
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "The question to reflect on."},
+            "bank_id": {
+                "type": "string",
+                "description": "Optional. Reflect on another profile's Hindsight bank. Fleet convention: hermes-{profile}. Omit for your own bank."
+            },
+            "response_schema": {
+                "type": "object",
+                "description": "Optional JSON Schema for structured output. When provided, the response will include a structured_output field with the LLM response parsed according to this schema."
+            },
+            "fact_types": {
+                "type": "array",
+                "items": {
+                    "type": "string",
+                    "enum": ["observation", "experience", "world", "opinion"]
+                },
+                "description": "Optional list of fact types to include in reflection (world, experience, observation, opinion). Omit for all types."
+            },
+        },
+        "required": ["query"],
+    },
 }
 
 
@@ -786,6 +844,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._auto_recall = cfg.get("auto_recall", True)
         self._recall_sync = bool(cfg.get("recall_sync", False))
         self._recall_max_tokens = int(cfg.get("recall_max_tokens", 4096))
+        # Config-level min_scores floors for the auto-recall/prefetch path
+        # (fleet default: {"semantic": 0.25, "reranker": 0.5} — Isa-verified
+        # 78->21 noise cut; NEVER use the "final" key — hangs the server).
+        # Tool-arg min_scores still overrides per call (see _tool_recall).
+        self._recall_min_scores = cfg.get("min_scores") or None
         self._recall_max_input_chars = int(cfg.get("recall_max_input_chars", 800))
         # None -> observation-only (Hindsight's consolidated, deduplicated layer; raw
         # world/experience facts re-ship the evidence they summarize and burn the
@@ -881,6 +944,8 @@ class HindsightMemoryProvider(MemoryProvider):
             kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
         if self._recall_types:
             kwargs["types"] = self._recall_types
+        if self._recall_min_scores:
+            kwargs["min_scores"] = self._recall_min_scores
         resp = self._run_hindsight_operation(lambda client: client.arecall(**kwargs))
         return resp.results or []
 
@@ -1100,19 +1165,68 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _tool_recall(self, args: dict) -> str:
         query = args["query"]
+        # Cross-bank support: use caller's bank_id when provided,
+        # otherwise default to this profile's own bank.
+        effective_bank_id = args.get("bank_id") or self._bank_id
+        recall_kwargs: dict = {
+            "bank_id": effective_bank_id, "query": query, "budget": self._budget,
+            "max_tokens": self._recall_max_tokens,
+        }
+        if self._recall_tags:
+            recall_kwargs["tags"] = self._recall_tags
+            recall_kwargs["tags_match"] = self._recall_tags_match
+        caller_types = args.get("types")
+        if caller_types is not None:
+            recall_kwargs["types"] = caller_types
+        elif self._recall_types:
+            recall_kwargs["types"] = self._recall_types
+        caller_min_scores = args.get("min_scores")
+        if caller_min_scores is not None:
+            recall_kwargs["min_scores"] = caller_min_scores
+        caller_query_timestamp = args.get("query_timestamp")
+        if caller_query_timestamp is not None:
+            recall_kwargs["query_timestamp"] = caller_query_timestamp
+        caller_include_source_facts = args.get("include_source_facts")
+        if caller_include_source_facts is not None:
+            recall_kwargs["include_source_facts"] = caller_include_source_facts
+        caller_max_source_facts_tokens = args.get("max_source_facts_tokens")
+        if caller_max_source_facts_tokens is not None:
+            recall_kwargs["max_source_facts_tokens"] = caller_max_source_facts_tokens
         logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",
-                     self._bank_id, len(query), self._budget)
-        results = self._recall(query)
-        logger.debug("Tool hindsight_recall: %d results", len(results))
-        return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+                     effective_bank_id, len(query), self._budget)
+        resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+        num_results = len(resp.results) if resp.results else 0
+        logger.debug("Tool hindsight_recall: bank=%s, %d results", effective_bank_id, num_results)
+        if not resp.results:
+            return "No relevant memories found."
+        lines = [f"{i}. {r.text}" for i, r in enumerate(resp.results, 1)]
+        text = "\n".join(lines)
+        if effective_bank_id != self._bank_id:
+            text += f"\n\n(bank: {effective_bank_id})"
+        return text
 
     def _tool_reflect(self, args: dict) -> str:
         query = args["query"]
+        effective_bank_id = args.get("bank_id") or self._bank_id
         logger.debug("Tool hindsight_reflect: bank=%s, query_len=%d, budget=%s",
-                     self._bank_id, len(query), self._budget)
-        text = self._reflect(query) or ""
-        logger.debug("Tool hindsight_reflect: response_len=%d", len(text))
-        return text or "No relevant memories found."
+                     effective_bank_id, len(query), self._budget)
+        reflect_kwargs: dict = {
+            "bank_id": effective_bank_id, "query": query, "budget": self._budget,
+        }
+        caller_response_schema = args.get("response_schema")
+        if caller_response_schema is not None:
+            reflect_kwargs["response_schema"] = caller_response_schema
+        caller_fact_types = args.get("fact_types")
+        if caller_fact_types is not None:
+            reflect_kwargs["fact_types"] = caller_fact_types
+        resp = self._run_hindsight_operation(lambda client: client.areflect(**reflect_kwargs))
+        logger.debug("Tool hindsight_reflect: response_len=%d", len(resp.text or ""))
+        text = resp.text or "No relevant memories found."
+        if getattr(resp, "structured_output", None) is not None:
+            text += "\n\n[structured_output] " + json.dumps(resp.structured_output)
+        if effective_bank_id != self._bank_id:
+            text += f"\n\n(bank: {effective_bank_id})"
+        return text
 
     # tool name -> (required arg, handler, user-facing failure prefix)
     _TOOL_HANDLERS = {
