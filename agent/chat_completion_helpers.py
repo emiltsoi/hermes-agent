@@ -1570,6 +1570,18 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
         "content": _assistant_content_for_storage(agent, assistant_message), "reasoning": reasoning_text,
         "finish_reason": finish_reason})
 
+    # Ollama / strict OpenAI-compatible custom providers reject
+    # ``content: null`` / ``content: None`` alongside ``tool_calls``.
+    # OpenAI itself accepts ``null``, but Ollama's /v1 compatibility
+    # layer returns HTTP 400 (\"invalid message content type:
+    # map[string]interface {}\" / \"<nil>\").  When the assistant
+    # response carries tool calls but no text content, normalise the
+    # content field to an empty string — symmetric with the
+    # ``reasoning_content`` pad below and the pydantic-ai fix
+    # (issue #5206).  #46490
+    if assistant_tool_calls and not msg.get("content"):
+        msg["content"] = ""
+
     raw_reasoning_content = getattr(assistant_message, "reasoning_content", None)
     if raw_reasoning_content is None:
         model_extra = getattr(assistant_message, "model_extra", None) or {}

@@ -403,8 +403,10 @@ def _last_turn_reasoning(messages) -> Optional[Any]:
     for msg in reversed(messages):
         if msg.get("role") == "user":
             return None  # turn boundary — don't cross into prior turns
-        if msg.get("role") == "assistant" and msg.get("reasoning"):
-            return msg["reasoning"]
+        # Fleet patch (2026-08-18): fall back to ``reasoning_content`` — DeepSeek/Kimi emit it
+        # as a distinct field (a message may carry reasoning=None + reasoning_content=text).
+        if msg.get("role") == "assistant" and (msg.get("reasoning") or msg.get("reasoning_content")):
+            return msg.get("reasoning") or msg.get("reasoning_content")
     return None
 
 
