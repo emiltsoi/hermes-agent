@@ -669,6 +669,13 @@ class GatewayAuthorizationMixin:
         if source.platform == Platform.WEBHOOK or getattr(_registry_entry(source.platform), "trusted_inbound", False) is True:
             return True
 
+        # Webhook-sourced sessions (even when target_session routes them to
+        # another platform like Telegram) are HMAC-authenticated — bypass the
+        # user allowlist regardless of effective platform. (fleet patch:
+        # A2A/mesh relay, ported 2026-09-10 rebase)
+        if source.user_id and source.user_id.startswith("webhook:"):
+            return True
+
         adapter_profile = self._adapter_profile_for_source(source)
         is_group = source.chat_type in _GROUP_CHAT_TYPES
         is_group_or_forum = source.chat_type in _GROUP_FORUM_TYPES
