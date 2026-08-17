@@ -1381,7 +1381,20 @@ class TelegramAdapter(BasePlatformAdapter):
             should_thread = reply_to_source is not None and self._reply_to_mode != "off"
         else:
             should_thread = self._should_thread_reply(reply_to_source, index)
-        reply_to_id = int(reply_to_source) if should_thread and reply_to_source else None
+        # Guard the int() conversion: non-numeric sources (topic IDs, platform
+        # identifiers) raise ValueError and previously cascaded a BadRequest
+        # through retry then failed silently (fleet patch, 2026-08-18).
+        # Drop the reply marker instead; the message still delivers.
+        reply_to_id = None
+        if should_thread and reply_to_source:
+            try:
+                reply_to_id = int(reply_to_source)
+            except (ValueError, TypeError):
+                logger.warning(
+                    "[Telegram] reply_to_id conversion failed for source=%r — dropping reply marker",
+                    reply_to_source,
+                )
+                reply_to_id = None
         return private_dm_topic_send, dm_topic_reply_to_off, reply_to_id
 
     def _compute_single_send_routing(
