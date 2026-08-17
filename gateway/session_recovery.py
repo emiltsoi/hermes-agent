@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import logging
 import json
+import os
 import threading
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from gateway.config import Platform
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
@@ -233,6 +234,32 @@ class SessionRecoveryMixin:
                 "Gateway session DB recovery ignored %s for %s because the row belongs to a "
                 "different profile", recovered.get("session_key"), session_key)
             return None, False
+        # Fleet guard (2026-08-18 #54878, re-ported 2026-09-10): refuse to
+        # reopen ``agent_close`` sessions whose ended_at is older than
+        # SESSION_REOPEN_MAX_AGE_HOURS (default 12). Reopening a days-old
+        # finalized session revives a zombie with stale Telegram message ids
+        # and a disconnected LCM DAG (the split-identity crash, #54878); a
+        # session that ended recently is safe to resume. Compression-split
+        # children are exempt (their end_reason is not agent_close).
+        _ended_reason = recovered.get("end_reason")
+        if _ended_reason == "agent_close":
+            _ended_at = recovered.get("ended_at")
+            if _ended_at is not None:
+                try:
+                    _ended_dt = datetime.fromtimestamp(float(_ended_at))
+                    _max_age_h = int(os.environ.get("SESSION_REOPEN_MAX_AGE_HOURS", "12"))
+                    if (now - _ended_dt) > timedelta(hours=_max_age_h):
+                        logger.warning(
+                            "Gateway session DB recovery: refusing to reopen "
+                            "agent_close session %s (ended %s, age > %dh "
+                            "limit) — creating fresh session",
+                            recovered.get("id"),
+                            _ended_dt.isoformat(),
+                            _max_age_h,
+                        )
+                        return None, False
+                except (TypeError, ValueError, OSError):
+                    pass
         entry = self._create_entry_from_recovered_row(
             row=recovered, session_key=session_key, source=source, now=now)
         return entry, migrated_legacy
