@@ -216,6 +216,12 @@ class Platform(Enum):
             with contextlib.suppress(Exception):
                 from gateway.platform_registry import platform_registry
                 registered = platform_registry.is_registered(value)
+        if not registered and value in PORT_BINDING_PLATFORM_VALUES:
+            # Port-binding plugin platforms (e.g. "mesh") may be referenced in
+            # config before their adapter module imports — keep config parsing
+            # free of any boot-time ordering dependency on plugin discovery
+            # (fleet patch, re-ported 2026-09-10).
+            registered = True
         return cls._add_pseudo_member(value) if registered else None
 
     @classmethod
@@ -251,6 +257,7 @@ _BUILTIN_PLATFORM_VALUES = frozenset(m.value for m in Platform.__members__.value
 PORT_BINDING_PLATFORM_VALUES = frozenset({
     "webhook", "api_server", "msgraph_webhook", "feishu", "wecom_callback",
     "bluebubbles", "sms", "whatsapp_cloud", "line", "teams",
+    "mesh",  # fleet patch: the mesh platform adapter binds its own port
 })
 # Platforms that only bind in one connection mode (Feishu's default websocket mode is outbound).
 PORT_BINDING_CONDITIONAL_MODES: dict[str, str] = {"feishu": "webhook"}
