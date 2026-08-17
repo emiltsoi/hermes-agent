@@ -1548,10 +1548,19 @@ class GatewayTurnMixin:
         if _quote:
             header, prefix, empty = _quote
             _quoted = "\n".join(f"{prefix}{ln}" if ln else empty for ln in display_reasoning.splitlines())
-            return f"{header}\n{_quoted}\n\n{response}"
-        # Escape ``` inside reasoning so inner fences don't break the outer code block.
-        display_reasoning = escape_code_fences_for_display(display_reasoning)
-        return f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
+            _reasoning_block = f"{header}\n{_quoted}"
+        else:
+            # Escape ``` inside reasoning so inner fences don't break the outer code block.
+            display_reasoning = escape_code_fences_for_display(display_reasoning)
+            _reasoning_block = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```"
+        if agent_result.get("already_sent"):
+            # Fleet patch #19 (2026-08-18, port of upstream PR #83893, re-ported
+            # 2026-09-10 onto the split run_turn module): streaming already
+            # delivered the body, so a prepend would never be sent. Hold the
+            # block for the trailing send in _hmwa_deliver_turn_response.
+            agent_result["_reasoning_pending_block"] = _reasoning_block
+            return response
+        return f"{_reasoning_block}\n\n{response}"
 
     def _hmwa_runtime_footer_line(self, agent_result, source, _turn_seconds):
         """Runtime-metadata footer for the FINAL message of the turn; off by default
@@ -1862,6 +1871,19 @@ class GatewayTurnMixin:
         if agent_result.get("already_sent") and not agent_result.get("failed"):
             if response and adapter:
                 await self._deliver_media_from_response(response, event, adapter)
+            # Fleet patch #19: the reasoning block was held back by
+            # _hmwa_prepend_reasoning (streaming already sent the body) —
+            # deliver it now as its own trailing message so streamed
+            # Telegram/Discord replies don't silently lose the thinking.
+            _reasoning_pending = agent_result.get("_reasoning_pending_block")
+            if _reasoning_pending and adapter:
+                try:
+                    await adapter.send(
+                        source.chat_id, _reasoning_pending,
+                        metadata=self._event_thread_metadata(event, source),
+                    )
+                except Exception as _e:
+                    logger.debug("trailing reasoning send failed: %s", _e)
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
                 try:
