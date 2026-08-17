@@ -1239,6 +1239,13 @@ def _build_gateway_agent_history(
         # Rich tool_calls/tool-result rows pass through intact so the API sees valid assistant→tool sequences.
         if "tool_calls" in msg or "tool_call_id" in msg or role == "tool":
             clean_msg = {k: v for k, v in msg.items() if k not in {"timestamp", "observed"}}
+            # Inject a minimal stub for assistant tool-call messages with
+            # empty text content so the message survives the content filter
+            # below.  Without this, empty stubs are dropped, creating
+            # consecutive-user adjacency that repair_message_sequence
+            # compound-merges — the root cause of A2A-trigger compounding.
+            if role == "assistant" and has_tool_calls and not clean_msg.get("content"):
+                clean_msg["content"] = "[Thinking]"
             agent_history.append(clean_msg)
         elif content or _has_replayable_sidecar(role, content, msg):
             replay_timestamp = msg.get("timestamp")
