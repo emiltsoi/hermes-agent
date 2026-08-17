@@ -4341,13 +4341,15 @@ class BasePlatformAdapter(ABC):
         scope_id: Optional[str] = None, guild_id: Optional[str] = None,
         parent_chat_id: Optional[str] = None, message_id: Optional[str] = None,
         role_authorized: bool = False, auto_thread_created: bool = False,
-        auto_thread_initial_name: Optional[str] = None) -> SessionSource:
+        auto_thread_initial_name: Optional[str] = None,
+        _platform: Optional["Platform"] = None,  # Override platform (for webhook routing)
+    ) -> SessionSource:
         """Build a SessionSource; with ``gateway.profile_routes`` configured the matching
         profile is stamped on ``source.profile`` for per-profile HERMES_HOME isolation."""
         def _opt(value) -> Optional[str]:
             return str(value) if value else None
         fields = dict(
-            platform=self.platform, chat_id=str(chat_id), chat_name=chat_name, chat_type=chat_type,
+            platform=_platform or self.platform, chat_id=str(chat_id), chat_name=chat_name, chat_type=chat_type,
             user_id=_opt(user_id), user_name=user_name, thread_id=_opt(thread_id),
             chat_topic=(chat_topic or "").strip() or None, user_id_alt=user_id_alt,
             chat_id_alt=chat_id_alt, is_bot=is_bot, scope_id=_opt(scope_id),
