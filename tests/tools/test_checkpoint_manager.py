@@ -643,6 +643,32 @@ class TestWorkingDirResolution:
         monkeypatch.setattr(_pl.Path, "exists", _guarded_exists)
         assert m.get_working_dir_for_path(str(filepath)) == str(filepath.parent)
 
+    def test_refuses_hermes_home_workdir(self, tmp_path, fake_home):
+        """Regression (2026-09-03, Jessie wedge): a profile write must NOT
+        resolve to ~/.hermes/.git as a checkpoint project — that registered
+        the whole Hermes home (state.db 1.2GB, lcm.db 607MB) as a snapshot,
+        exceeding the git timeout and wedging every file-mutating call.
+        get_working_dir_for_path must refuse workdirs at/under ~/.hermes.
+        """
+        m = CheckpointManager(enabled=True)
+
+        # fake_home = tmp HOME; simulate ~/.hermes/.git (the fleet repo) + a
+        # profile write. Never touches the real home.
+        hermes_home = fake_home / ".hermes"
+        (hermes_home / ".git").mkdir(parents=True, exist_ok=True)
+        profile = hermes_home / "profiles" / "testwife"
+        profile.mkdir(parents=True, exist_ok=True)
+
+        result = m.get_working_dir_for_path(str(profile / "AGENTS.md"))
+        # Must NOT resolve to ~/.hermes (the guarded workdir) — it falls
+        # back to the candidate (the profile dir, which has no .git).
+        assert result != str(hermes_home), (
+            f"resolved to {hermes_home} — the pathological registration"
+        )
+        assert str(hermes_home) not in result or result == str(profile), (
+            f"unexpected resolution: {result}"
+        )
+
 
 # =========================================================================
 # Git env isolation
