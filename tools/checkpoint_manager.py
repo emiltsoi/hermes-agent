@@ -155,6 +155,13 @@ DEFAULT_EXCLUDES = [
     "Thumbs.db",
     # Logs
     "*.log",
+
+    # Database / state files (2026-09-03 fleet patch, Jessie wedge: hashing
+    # state.db (1.2GB) + lcm.db (607MB) exceeded the git timeout → stale
+    # index lock → every file-mutating call wedged in a git-add loop)
+    "*.db", "*.db-wal", "*.db-shm", "*.sqlite", "*.sqlite3", "*.sqlite-wal", "*.sqlite-shm",
+    # Large state / data / session trees (Hermes profiles)
+    "data/", "sessions/", "home/", "lcm-large-outputs/",
 ]
 
 # Git subprocess timeout (seconds).
@@ -1406,6 +1413,21 @@ class CheckpointManager:
         check = candidate
         while check != check.parent and check not in broad:
             if any((check / m).exists() for m in markers):
+                # GUARD (2026-09-03, Jessie wedge): never register a workdir
+                # at/under ~/.hermes (the fleet/home repo) from a profile write.
+                # get_working_dir_for_path walks UP from any profile path
+                # (~/.hermes/profiles/<wife>/...) and lands on ~/.hermes/.git →
+                # the whole Hermes home (state.db 1.2GB, lcm.db 607MB, sessions/)
+                # becomes a checkpoint snapshot → git add -A exceeds the timeout
+                # → stale index lock → every file-mutating call wedges. Refuse
+                # workdirs at/under ~/.hermes; the caller falls back to the
+                # candidate itself (no .git → no checkpoint project).
+                hermes_home = Path.home() / ".hermes"
+                try:
+                    if check == hermes_home or hermes_home in check.parents:
+                        return str(candidate)
+                except OSError:
+                    pass
                 return str(check)
             check = check.parent
 
