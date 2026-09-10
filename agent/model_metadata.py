@@ -344,8 +344,11 @@ DEFAULT_CONTEXT_LENGTHS = {
     # DeepSeek — V4 family is 1M; deepseek-chat/-reasoner alias v4-flash modes. ``deepseek-flash``
     # (version-less canonical id, 2026-09 Flash refresh) needs a discrete entry or the
     # longest-key-first scan falls through to the 128K ``deepseek`` catch-all below.
+    # V4.1 (2026-09-10): ``deepseek-v4.1-flash`` / ``-pro`` inherit the 1M window. The family
+    # key ``deepseek-v4.1`` keeps future v4.1 variants (``-fast``, ``-vision``) at 1M — without
+    # these entries the ids fall through to the 128K ``deepseek`` catch-all (2026-09-10 incident).
     # https://api-docs.deepseek.com/zh-cn/quick_start/pricing
-    "deepseek-v4-pro": 1_000_000, "deepseek-v4.1-flash": 1_000_000, "deepseek-v4-flash": 1_000_000, "deepseek-chat": 1_000_000,
+    "deepseek-v4-pro": 1_000_000, "deepseek-v4.1-pro": 1_000_000, "deepseek-v4.1-flash": 1_000_000, "deepseek-v4-flash": 1_000_000, "deepseek-v4.1": 1_000_000, "deepseek-chat": 1_000_000,
     "deepseek-reasoner": 1_000_000, "deepseek-flash": 1_000_000, "deepseek": 128000,
     # Meta; Muse Spark family (1.1/1.2/1.3, -contributor(-free), meta/ prefixed) is 1M per OpenRouter,
     # models.dev and api.commandcode.ai /models — keep the "muse-spark" prefix (bare "muse" would match

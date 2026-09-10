@@ -356,6 +356,8 @@ class TestDefaultContextLengths:
         expected_keys = {
             "deepseek-v4-pro": 1_000_000,
             "deepseek-v4-flash": 1_000_000,
+            "deepseek-v4.1-pro": 1_000_000,
+            "deepseek-v4.1-flash": 1_000_000,
             "deepseek-chat": 1_000_000,
             "deepseek-reasoner": 1_000_000,
             # Version-less canonical Flash id (2026-09 Flash refresh).
@@ -379,6 +381,10 @@ class TestDefaultContextLengths:
                 ("deepseek-v4-flash", 1_000_000),
                 ("deepseek/deepseek-v4-pro", 1_000_000),
                 ("deepseek/deepseek-v4-flash", 1_000_000),
+                ("deepseek-v4.1-flash", 1_000_000),
+                ("deepseek-v4.1-pro", 1_000_000),
+                ("deepseek/deepseek-v4.1-flash", 1_000_000),
+                ("deepseek/deepseek-v4.1-pro", 1_000_000),
                 ("deepseek-chat", 1_000_000),
                 ("deepseek-reasoner", 1_000_000),
                 ("deepseek-flash", 1_000_000),
