@@ -1280,7 +1280,7 @@ def _build_gateway_agent_history(
             # below.  Without this, empty stubs are dropped, creating
             # consecutive-user adjacency that repair_message_sequence
             # compound-merges — the root cause of A2A-trigger compounding.
-            if role == "assistant" and has_tool_calls and not clean_msg.get("content"):
+            if role == "assistant" and "tool_calls" in msg and not clean_msg.get("content"):
                 clean_msg["content"] = "[Thinking]"
             agent_history.append(clean_msg)
         elif content or _has_replayable_sidecar(role, content, msg):
