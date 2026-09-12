@@ -681,6 +681,12 @@ DEFAULT_CONFIG = {
         "idle_compact_after_seconds": 0,
         # Opt-in: write the next summary in the background near the trigger; compaction uses (or waits for) it if it still covers the same messages.
         "prepare_ahead": False,
+        # Opt-in stall suspend (false = off): when a turn's compression passes already proved
+        # ineffective (<5% cut while still over threshold), hold the turn with a soft
+        # compression_deferred result instead of sending the oversized request. The session is
+        # preserved and retries compression on the next inbound message — never the
+        # compression_exhausted contract the gateway answers with a session reset.
+        "suspend_on_stall": False,
     },
     # Anthropic prompt caching (Claude via OpenRouter or native API). cache_ttl: "5m" | "1h" | "auto"
     # (auto = 1h for human-paced sessions — cli/tui/desktop/messaging — and 5m for subagent, cron,
