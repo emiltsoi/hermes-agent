@@ -61,10 +61,12 @@ DEFAULT_EXCLUDES = [
     # index lock → every file-mutating call wedged in a git-add loop)
     "*.db", "*.db-wal", "*.db-shm", "*.sqlite", "*.sqlite3", "*.sqlite-wal", "*.sqlite-shm",
     # Large state / data / session trees (Hermes profiles)
-    "data/", "sessions/", "home/", "lcm-large-outputs/",
+    "data/", "sessions/", "home/", "lcm-large-outputs/", "checkpoints/", "lsp/",
 ]
 
 _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
+_STALE_LOCK_AGE_S = 180  # a measured index lock older than this is ours, not a live git's
+_EXCLUDE_MARKER_NAME = ".exclude_rev"  # store-root marker: sha256 of the DEFAULT_EXCLUDES revision
 _MAX_FILES = 50_000  # skip huge directories to avoid slowdowns
 _COMMIT_HASH_RE = re.compile(r'^[0-9a-fA-F]{4,64}$')  # short or full SHA-1/SHA-256
 _MB = 1024 * 1024
@@ -254,22 +256,44 @@ def _run_git(args: List[str], store: Path, working_dir: str, timeout: int = _GIT
         logger.error("Git command skipped: %s (%s)", " ".join(cmd), msg)
         return False, "", msg
 
-    try:
-        result = _git_subprocess(cmd, _git_env(store, str(wd), index_file=index_file), timeout, cwd=str(wd))
-    except subprocess.TimeoutExpired:
-        msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
-        logger.error(msg, exc_info=True)
-        return False, "", msg
-    except FileNotFoundError as exc:
-        if getattr(exc, "filename", None) == "git":
-            logger.error("Git executable not found: %s", " ".join(cmd), exc_info=True)
-            return False, "", "git not found"
-        msg = f"working directory not found: {wd}"
-        logger.error("Git command failed before execution: %s (%s)", " ".join(cmd), msg, exc_info=True)
-        return False, "", msg
-    except Exception as exc:
-        logger.error("Unexpected git error running %s: %s", " ".join(cmd), exc, exc_info=True)
-        return False, "", str(exc)
+    result = None
+    for _attempt in range(2):  # one retry at most, after removing a provably stale lock
+        try:
+            result = _git_subprocess(cmd, _git_env(store, str(wd), index_file=index_file),
+                                     timeout, cwd=str(wd))
+        except subprocess.TimeoutExpired:
+            if index_file is not None:
+                lock = Path(str(index_file) + ".lock")
+                if lock.exists():
+                    _unlink_quiet(lock)
+                    logger.warning("Removed index lock %s left by a timed-out git call — a leftover "
+                                   "lock makes every later checkpoint fail rc=128: %s", lock, " ".join(cmd))
+            msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
+            logger.error(msg, exc_info=True)
+            return False, "", msg
+        except FileNotFoundError as exc:
+            if getattr(exc, "filename", None) == "git":
+                logger.error("Git executable not found: %s", " ".join(cmd), exc_info=True)
+                return False, "", "git not found"
+            msg = f"working directory not found: {wd}"
+            logger.error("Git command failed before execution: %s (%s)", " ".join(cmd), msg, exc_info=True)
+            return False, "", msg
+        except Exception as exc:
+            logger.error("Unexpected git error running %s: %s", " ".join(cmd), exc, exc_info=True)
+            return False, "", str(exc)
+        # Lock-exists failure: only ever touch the lock for OUR index file, and only when its
+        # age proves no live git owns it (a fresh lock may belong to a concurrent process).
+        if result.returncode == 128 and index_file is not None and "File exists" in result.stderr:
+            match = re.search(r"Unable to create '([^']+\.lock)'", result.stderr)
+            lock = Path(str(index_file) + ".lock")
+            if match and match.group(1) == str(lock):
+                age = _mtime_or_none(lock)
+                if age is not None and time.time() - age >= _STALE_LOCK_AGE_S:
+                    _unlink_quiet(lock)
+                    logger.warning("Removed stale index lock %s (age %ss) — retrying once: %s",
+                                   lock, int(time.time() - age), " ".join(cmd))
+                    continue
+        break
 
     ok = result.returncode == 0
     # NUL-delimited output contains literal paths, including leading spaces.
@@ -415,8 +439,40 @@ def _migrate_legacy_store(base: Path) -> Optional[Path]:
     return legacy_root
 
 
+def _refresh_exclude(store: Path) -> None:
+    """Merge any missing ``DEFAULT_EXCLUDES`` entries into an existing store's ``info/exclude``.
+
+    Stores are created once and reused forever, so entries added to ``DEFAULT_EXCLUDES`` after a
+    store's creation would otherwise never apply and later snapshots keep walking huge trees.
+    Existing lines (including manual comments) are preserved verbatim; only additions are appended.
+    The ``.exclude_rev`` marker at the store root records which revision was applied, so the common
+    case is one cheap read.  Never raises."""
+    want = hashlib.sha256("\n".join(DEFAULT_EXCLUDES).encode("utf-8")).hexdigest()
+    exclude_path = store / "info" / "exclude"
+    marker = store / _EXCLUDE_MARKER_NAME
+    try:
+        current = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        current = ""
+    if current == want and exclude_path.exists():
+        return
+    try:
+        existing = exclude_path.read_text(encoding="utf-8").splitlines() if exclude_path.exists() else []
+        present = {line.strip() for line in existing}
+        additions = [entry for entry in DEFAULT_EXCLUDES if entry.strip() not in present]
+        if additions:
+            exclude_path.parent.mkdir(parents=True, exist_ok=True)
+            exclude_path.write_text("\n".join(existing + additions) + "\n", encoding="utf-8")
+            logger.info("checkpoint exclude refreshed: +%d entries", len(additions))
+        marker.write_text(want, encoding="utf-8")
+    except OSError:
+        logger.debug("Failed to refresh checkpoint exclude for %s", store, exc_info=True)
+
+
 def _init_store(store: Path, working_dir: str) -> Optional[str]:
-    """Initialise the shared store if needed (migrating pre-v2 repos first).  Returns error or None."""
+    """Initialise the shared store if needed (migrating pre-v2 repos first) and merge any newer
+    ``DEFAULT_EXCLUDES`` entries into ``info/exclude`` for both new and pre-existing stores.
+    Returns error or None."""
     base = store.parent
     if not store.exists():
         try:
@@ -425,6 +481,7 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
             return f"Could not create checkpoint base: {exc}"
         _migrate_legacy_store(base)
     if _store_has_head(store):
+        _refresh_exclude(store)
         return None
     for d in (store, store / _INDEXES_DIRNAME, store / _PROJECTS_DIRNAME):
         d.mkdir(parents=True, exist_ok=True)
@@ -440,6 +497,7 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
         _run_git(["config", key, value], store, str(base))
     (store / "info").mkdir(exist_ok=True)
     (store / "info" / "exclude").write_text("\n".join(DEFAULT_EXCLUDES) + "\n", encoding="utf-8")
+    _refresh_exclude(store)
     logger.debug("Initialised checkpoint store at %s", store)
     return None
 

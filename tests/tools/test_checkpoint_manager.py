@@ -13,6 +13,9 @@ from unittest.mock import patch
 
 from tools.checkpoint_manager import (
     CheckpointManager,
+    DEFAULT_EXCLUDES,
+    _EXCLUDE_MARKER_NAME,
+    _STALE_LOCK_AGE_S,
     _init_store,
     _run_git,
     _git_env,
@@ -134,6 +137,41 @@ class TestStoreInit:
         assert len(legacies) == 1
         assert (legacies[0] / fake_repo.name).exists()
         assert (legacies[0] / fake_repo.name / "HEAD").exists()
+
+
+class TestExcludeRefresh:
+    """Pre-existing stores must pick up entries added to DEFAULT_EXCLUDES after creation."""
+
+    def test_existing_store_merges_new_entries_and_keeps_custom_lines(
+        self, work_dir, checkpoint_base, monkeypatch,
+    ):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        store = _store_path(checkpoint_base)
+        assert _init_store(store, str(work_dir)) is None
+
+        # Simulate an old store: hand-edited rules, a missing entry, and no revision marker.
+        exclude = store / "info" / "exclude"
+        exclude.write_text("node_modules/\n# manual merge\ncustom-keep/\n", encoding="utf-8")
+        (store / _EXCLUDE_MARKER_NAME).unlink()
+
+        assert _init_store(store, str(work_dir)) is None
+        lines = [ln.strip() for ln in exclude.read_text(encoding="utf-8").splitlines()]
+        for entry in DEFAULT_EXCLUDES:
+            assert entry in lines, f"{entry!r} not merged"
+        assert "# manual merge" in lines
+        assert "custom-keep/" in lines
+        assert (store / _EXCLUDE_MARKER_NAME).exists()
+
+    def test_current_store_is_not_rewritten(self, work_dir, checkpoint_base, monkeypatch):
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        store = _store_path(checkpoint_base)
+        assert _init_store(store, str(work_dir)) is None
+        exclude = store / "info" / "exclude"
+        before, mtime = exclude.read_text(encoding="utf-8"), exclude.stat().st_mtime_ns
+
+        assert _init_store(store, str(work_dir)) is None
+        assert exclude.read_text(encoding="utf-8") == before
+        assert exclude.stat().st_mtime_ns == mtime
 
 
 # =========================================================================
@@ -702,6 +740,106 @@ class TestGitEnvIsolation:
         tilde_work.mkdir()
         env = _git_env(store, f"~/{tilde_work.name}")
         assert env["GIT_WORK_TREE"] == str(tilde_work.resolve())
+
+
+# =========================================================================
+# Index-lock recovery (a stale lock must not wedge every later checkpoint)
+# =========================================================================
+
+class TestIndexLockRecovery:
+    @staticmethod
+    def _lock(index_file: Path) -> Path:
+        return Path(str(index_file) + ".lock")
+
+    @staticmethod
+    def _lock_exists_result(lock_path: Path) -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(
+            args=["git", "add", "-A"], returncode=128, stdout="",
+            stderr=f"fatal: Unable to create '{lock_path}': File exists. "
+                   "Another git process seems to be running in this repository.",
+        )
+
+    def _setup(self, tmp_path):
+        work = tmp_path / "work"
+        work.mkdir()
+        store = tmp_path / "store"
+        index_file = store / "indexes" / "abc"
+        index_file.parent.mkdir(parents=True)
+        return work, store, index_file
+
+    def test_timeout_removes_the_index_lock(self, tmp_path, monkeypatch, caplog):
+        work, store, index_file = self._setup(tmp_path)
+        lock = self._lock(index_file)
+        lock.write_text("", encoding="utf-8")
+
+        def timeout(*args, **kwargs):
+            raise subprocess.TimeoutExpired(cmd="git", timeout=1)
+        monkeypatch.setattr("tools.checkpoint_manager._git_subprocess", timeout)
+
+        with caplog.at_level(logging.WARNING, logger="tools.checkpoint_manager"):
+            ok, stdout, stderr = _run_git(["add", "-A"], store, str(work), index_file=index_file)
+        assert (ok, stdout) == (False, "")
+        assert stderr
+        assert not lock.exists()
+        assert any("index lock" in r.getMessage() for r in caplog.records)
+
+    def test_old_lock_is_removed_and_git_retried_once(self, tmp_path, monkeypatch):
+        work, store, index_file = self._setup(tmp_path)
+        lock = self._lock(index_file)
+        lock.write_text("", encoding="utf-8")
+        old = time.time() - (_STALE_LOCK_AGE_S + 60)
+        os.utime(lock, (old, old))
+
+        calls = []
+
+        def fake(cmd, env, timeout, cwd=None):
+            calls.append(cmd)
+            if len(calls) == 2:
+                return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="ok\n", stderr="")
+            return self._lock_exists_result(lock)
+        monkeypatch.setattr("tools.checkpoint_manager._git_subprocess", fake)
+
+        ok, stdout, _ = _run_git(["add", "-A"], store, str(work), index_file=index_file)
+        assert ok is True
+        assert stdout == "ok"
+        assert len(calls) == 2
+        assert not lock.exists()
+
+    def test_fresh_lock_is_left_alone_and_not_retried(self, tmp_path, monkeypatch):
+        work, store, index_file = self._setup(tmp_path)
+        lock = self._lock(index_file)
+        lock.write_text("", encoding="utf-8")  # mtime is now — may belong to a live git
+
+        calls = []
+
+        def fake(cmd, env, timeout, cwd=None):
+            calls.append(cmd)
+            return self._lock_exists_result(lock)
+        monkeypatch.setattr("tools.checkpoint_manager._git_subprocess", fake)
+
+        ok, _, _ = _run_git(["add", "-A"], store, str(work), index_file=index_file)
+        assert ok is False
+        assert len(calls) == 1
+        assert lock.exists()
+
+    def test_foreign_lock_path_is_never_removed(self, tmp_path, monkeypatch):
+        work, store, index_file = self._setup(tmp_path)
+        foreign = tmp_path / "elsewhere.lock"
+        foreign.write_text("", encoding="utf-8")
+        old = time.time() - (_STALE_LOCK_AGE_S + 60)
+        os.utime(foreign, (old, old))
+
+        calls = []
+
+        def fake(cmd, env, timeout, cwd=None):
+            calls.append(cmd)
+            return self._lock_exists_result(foreign)
+        monkeypatch.setattr("tools.checkpoint_manager._git_subprocess", fake)
+
+        ok, _, _ = _run_git(["add", "-A"], store, str(work), index_file=index_file)
+        assert ok is False
+        assert len(calls) == 1
+        assert foreign.exists()
 
 
 # =========================================================================
