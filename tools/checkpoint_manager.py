@@ -161,11 +161,19 @@ DEFAULT_EXCLUDES = [
     # index lock → every file-mutating call wedged in a git-add loop)
     "*.db", "*.db-wal", "*.db-shm", "*.sqlite", "*.sqlite3", "*.sqlite-wal", "*.sqlite-shm",
     # Large state / data / session trees (Hermes profiles)
-    "data/", "sessions/", "home/", "lcm-large-outputs/",
+    "data/", "sessions/", "home/", "lcm-large-outputs/", "checkpoints/", "lsp/",
 ]
 
 # Git subprocess timeout (seconds).
 _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
+_STALE_LOCK_AGE_S = 180  # a measured index lock older than this is ours, not a live git's
+_EXCLUDE_MARKER_NAME = ".exclude_rev"  # store-root marker: sha256 of the DEFAULT_EXCLUDES revision
+# Inherited GIT_* vars that would redirect the shadow store's git calls.
+_GIT_LEAK_VARS = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_NAMESPACE", "GIT_ALTERNATE_OBJECT_DIRECTORIES")
+# Per-store config: isolated by env vars already, but belt-and-suspenders.
+_STORE_GIT_CONFIG = (("user.email", "hermes@local"), ("user.name", "Hermes Checkpoint"),
+                     ("commit.gpgsign", "false"), ("tag.gpgSign", "false"), ("gc.auto", "0"))
+_PROJECT_MARKERS = {".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod", "Makefile", "pom.xml", ".hg", "Gemfile"}
 
 # Max files to snapshot — skip huge directories to avoid slowdowns.
 _MAX_FILES = 50_000
@@ -393,49 +401,65 @@ def _run_git(
     if git is None:
         return False, "", "git is not installed or not on PATH"
     cmd = [git, *args]
-    allowed_returncodes = allowed_returncodes or set()
 
-    try:
-        # NUL-delimited git output contains literal filenames, not text lines.
-        text_options = {} if "-z" in args else {"text": True, "encoding": "utf-8", "errors": "replace"}
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            **text_options,
-            timeout=timeout,
-            env=env,
-            cwd=str(normalized_working_dir),
-            stdin=subprocess.DEVNULL,
-            # Checkpoints fire several bare git calls per turn from the
-            # console-less desktop/gateway backend; suppress the per-call
-            # conhost flash on Windows (no-op on POSIX).
-            creationflags=windows_hide_flags(),
-            check=False,
+    for _attempt in range(2):  # one retry at most, after removing a provably stale lock
+        try:
+            result = _git_subprocess(cmd, env, timeout, cwd=str(normalized_working_dir))
+        except subprocess.TimeoutExpired:
+            # FLEET PATCH: a killed git leaves its index lock behind; nothing else ever
+            # removes it, and every later call then fails rc=128 in milliseconds forever.
+            if index_file is not None:
+                lock = Path(str(index_file) + ".lock")
+                if lock.exists():
+                    _unlink_quiet(lock)
+                    logger.warning("Removed index lock %s left by a timed-out git call — a leftover "
+                                   "lock makes every later checkpoint fail rc=128: %s", lock, " ".join(cmd))
+            msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
+            logger.error(msg, exc_info=True)
+            return False, "", msg
+        except FileNotFoundError as exc:
+            missing_target = getattr(exc, "filename", None)
+            if missing_target == "git":
+                logger.error("Git executable not found: %s", " ".join(cmd), exc_info=True)
+                return False, "", "git not found"
+            msg = f"working directory not found: {normalized_working_dir}"
+            logger.error("Git command failed before execution: %s (%s)", " ".join(cmd), msg, exc_info=True)
+            return False, "", msg
+        except Exception as exc:
+            logger.error("Unexpected git error running %s: %s", " ".join(cmd), exc, exc_info=True)
+            return False, "", str(exc)
+        # FLEET PATCH: lock-exists failure. Only ever touch the lock for OUR index file, and only
+        # when its age proves no live git owns it (a fresh lock may belong to a concurrent process).
+        if result.returncode == 128 and index_file is not None:
+            _err_txt = (result.stderr.decode("utf-8", errors="replace")
+                        if isinstance(result.stderr, (bytes, bytearray)) else result.stderr)
+            if "File exists" in _err_txt:
+                match = re.search(r"Unable to create '([^']+\.lock)'", _err_txt)
+                lock = Path(str(index_file) + ".lock")
+                if match and match.group(1) == str(lock):
+                    # Latent NameError fixed during the 2026-09-29 rebase: this helper used to
+                    # live in THIS module, but upstream moved it to tools/file_state.py (with a
+                    # str signature). Stat inline rather than coupling to an underscore-private
+                    # helper across modules.
+                    try:
+                        age = lock.stat().st_mtime
+                    except OSError:
+                        age = None
+                    if age is not None and time.time() - age >= _STALE_LOCK_AGE_S:
+                        _unlink_quiet(lock)
+                        logger.warning("Removed stale index lock %s (age %ss) — retrying once: %s",
+                                       lock, int(time.time() - age), " ".join(cmd))
+                        continue
+        break
+    ok = result.returncode == 0
+    stdout = os.fsdecode(result.stdout) if "-z" in args else result.stdout.strip()
+    stderr = result.stderr.decode("utf-8", errors="replace").strip() if "-z" in args else result.stderr.strip()
+    if not ok and result.returncode not in allowed_returncodes:
+        logger.error(
+            "Git command failed: %s (rc=%d) stderr=%s",
+            " ".join(cmd), result.returncode, stderr,
         )
-        ok = result.returncode == 0
-        stdout = os.fsdecode(result.stdout) if "-z" in args else result.stdout.strip()
-        stderr = result.stderr.decode("utf-8", errors="replace").strip() if "-z" in args else result.stderr.strip()
-        if not ok and result.returncode not in allowed_returncodes:
-            logger.error(
-                "Git command failed: %s (rc=%d) stderr=%s",
-                " ".join(cmd), result.returncode, stderr,
-            )
-        return ok, stdout, stderr
-    except subprocess.TimeoutExpired:
-        msg = f"git timed out after {timeout}s: {' '.join(cmd)}"
-        logger.error(msg, exc_info=True)
-        return False, "", msg
-    except FileNotFoundError as exc:
-        missing_target = getattr(exc, "filename", None)
-        if missing_target == "git":
-            logger.error("Git executable not found: %s", " ".join(cmd), exc_info=True)
-            return False, "", "git not found"
-        msg = f"working directory not found: {normalized_working_dir}"
-        logger.error("Git command failed before execution: %s (%s)", " ".join(cmd), msg, exc_info=True)
-        return False, "", msg
-    except Exception as exc:
-        logger.error("Unexpected git error running %s: %s", " ".join(cmd), exc, exc_info=True)
-        return False, "", str(exc)
+    return ok, stdout, stderr
 
 
 def _git_out(args: list[str], store: Path, working_dir: str, rc: Optional[set[int]] = None) -> str:
@@ -513,12 +537,40 @@ def _migrate_legacy_store(base: Path) -> Optional[Path]:
     return legacy_root
 
 
-def _init_store(store: Path, working_dir: str) -> Optional[str]:
-    """Initialise the shared shadow store if needed.  Returns error or None.
+def _refresh_exclude(store: Path) -> None:
+    """Merge any missing ``DEFAULT_EXCLUDES`` entries into an existing store's ``info/exclude``.
 
-    Also performs one-time migration of pre-v2 per-directory shadow repos
-    into ``legacy-<timestamp>/``.
-    """
+    Stores are created once and reused forever, so entries added to ``DEFAULT_EXCLUDES`` after a
+    store's creation would otherwise never apply and later snapshots keep walking huge trees.
+    Existing lines (including manual comments) are preserved verbatim; only additions are appended.
+    The ``.exclude_rev`` marker at the store root records which revision was applied, so the common
+    case is one cheap read.  Never raises."""
+    want = hashlib.sha256("\n".join(DEFAULT_EXCLUDES).encode("utf-8")).hexdigest()
+    exclude_path = store / "info" / "exclude"
+    marker = store / _EXCLUDE_MARKER_NAME
+    try:
+        current = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        current = ""
+    if current == want and exclude_path.exists():
+        return
+    try:
+        existing = exclude_path.read_text(encoding="utf-8").splitlines() if exclude_path.exists() else []
+        present = {line.strip() for line in existing}
+        additions = [entry for entry in DEFAULT_EXCLUDES if entry.strip() not in present]
+        if additions:
+            exclude_path.parent.mkdir(parents=True, exist_ok=True)
+            exclude_path.write_text("\n".join(existing + additions) + "\n", encoding="utf-8")
+            logger.info("checkpoint exclude refreshed: +%d entries", len(additions))
+        marker.write_text(want, encoding="utf-8")
+    except OSError:
+        logger.debug("Failed to refresh checkpoint exclude for %s", store, exc_info=True)
+
+
+def _init_store(store: Path, working_dir: str) -> Optional[str]:
+    """Initialise the shared store if needed (migrating pre-v2 repos first) and merge any newer
+    ``DEFAULT_EXCLUDES`` entries into ``info/exclude`` for both new and pre-existing stores.
+    Returns error or None."""
     base = store.parent
     # One-time legacy migration before we create the store.
     if not store.exists():
@@ -531,6 +583,7 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
         _migrate_legacy_store(base)
 
     if (store / "HEAD").exists():
+        _refresh_exclude(store)
         return None
 
     store.mkdir(parents=True, exist_ok=True)
@@ -566,23 +619,11 @@ def _init_store(store: Path, working_dir: str) -> Optional[str]:
             return f"Shadow store init failed: {result.stderr.strip()}"
     except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
         return f"Shadow store init failed: {exc}"
-
-    # Per-store config (isolated by env vars above, but belt-and-suspenders).
-    # Use the base dir as the working_dir for config commands — it always
-    # exists since we just created the store inside it.
-    cfg_wd = str(base)
-    _run_git(["config", "user.email", "hermes@local"], store, cfg_wd)
-    _run_git(["config", "user.name", "Hermes Checkpoint"], store, cfg_wd)
-    _run_git(["config", "commit.gpgsign", "false"], store, cfg_wd)
-    _run_git(["config", "tag.gpgSign", "false"], store, cfg_wd)
-    _run_git(["config", "gc.auto", "0"], store, cfg_wd)
-
-    info_dir = store / "info"
-    info_dir.mkdir(exist_ok=True)
-    (info_dir / "exclude").write_text(
-        "\n".join(DEFAULT_EXCLUDES) + "\n", encoding="utf-8"
-    )
-
+    for key, value in _STORE_GIT_CONFIG:
+        _run_git(["config", key, value], store, str(base))
+    (store / "info").mkdir(exist_ok=True)
+    (store / "info" / "exclude").write_text("\n".join(DEFAULT_EXCLUDES) + "\n", encoding="utf-8")
+    _refresh_exclude(store)
     logger.debug("Initialised checkpoint store at %s", store)
     return None
 
