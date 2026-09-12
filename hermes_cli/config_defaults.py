@@ -639,6 +639,12 @@ DEFAULT_CONFIG = {
         # already at/below threshold × target_ratio; honors the same cooldown/ anti-thrash/lock
         # guards. Example: 1800 = 30 min.
         "idle_compact_after_seconds": 0,
+        # Opt-in stall suspend (false = off): when a turn's compression passes already proved
+        # ineffective (<5% cut while still over threshold), hold the turn with a soft
+        # compression_deferred result instead of sending the oversized request. The session is
+        # preserved and retries compression on the next inbound message — never the
+        # compression_exhausted contract the gateway answers with a session reset.
+        "suspend_on_stall": False,
     },
     # Anthropic prompt caching (Claude via OpenRouter or native API). cache_ttl: "5m" | "1h"; other
     # non-falsy values are ignored; falsy (false, null, "off", "disabled", "no", "none") disables

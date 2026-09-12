@@ -989,7 +989,7 @@ def _partial_turn_result(
 
 
 def _compression_deferred_result(agent, messages: List[Dict], api_call_count: int, reason: str = "lock") -> Dict[str, Any]:
-    """Soft turn result for a transiently-deferred compression. Both reasons must end as
+    """Soft turn result for a transiently-deferred compression. Every reason must end as
     ``compression_deferred``, never ``compression_exhausted`` — the gateway wipes the
     session on exhaustion (#9893/#35809). ``failed`` stays False; the turn persists."""
     session = agent.session_id or "none"
@@ -1002,6 +1002,18 @@ def _compression_deferred_result(agent, messages: List[Dict], api_call_count: in
         _final = (
             "Context compression is temporarily paused after a recent failed attempt. Please retry "
             "in a moment — compression will resume automatically (or run /compress to force a retry now)."
+        )
+    elif reason == "stall":
+        logger.info(
+            "turn suspended: compression made no progress while over threshold "
+            "(session=%s) — holding until compression recovers; not counting as "
+            "compression exhaustion", session,
+        )
+        _final = (
+            "Context is over the compression threshold and compression is not making progress, "
+            "so this turn was held instead of sending an oversized request. The session is "
+            "preserved — it retries compression automatically on your next message "
+            "(or run /compress to force a retry now)."
         )
     else:
         holder = getattr(agent, "_compression_skipped_due_to_lock", None)

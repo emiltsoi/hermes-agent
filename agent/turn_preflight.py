@@ -197,6 +197,28 @@ def run_preflight_compression(
         # All recovery passes consumed and still over threshold: fail closed —
         # llama.cpp may silently truncate an oversized retry.
         return _done("return", _exhausted_result())
+    elif (
+        getattr(agent, "compression_suspend_on_stall", False)
+        and agent.compression_enabled
+        and len(v.messages) > 1
+        and v._preflight_compression_blocked
+        and not provider_overflow_preflight
+        and not _review_fork_first_request_pending(agent)
+        and not defer_preflight(request_pressure_tokens)
+        and compressor.should_compress(request_pressure_tokens)
+    ):
+        # Stall suspend (opt-in ``compression.suspend_on_stall``): the blocker arms
+        # only after a real pass cut <5% while still over threshold — further passes
+        # on the same transcript are proved ineffective. Hold the turn instead of
+        # sending the oversized request: ``compression_deferred`` persists the
+        # session and lets the next inbound retry compression; never
+        # ``compression_exhausted`` (the gateway wipes the session on that). Only
+        # reachable when provider overflow is NOT pending — the proven-overflow
+        # branches above keep their stronger contract.
+        agent._persist_session(v.messages, v.conversation_history)
+        return _done("return", _compression_deferred_result(
+            agent, v.messages, v.api_call_count, reason="stall"
+        ))
     elif _eligible and not defer_preflight(request_pressure_tokens) and _compression_cooldown:
         # Summary-LLM cooldown blocks compression: deduped warning only when over
         # threshold (should_compress_info reason is None below it).

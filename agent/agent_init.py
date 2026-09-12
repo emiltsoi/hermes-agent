@@ -1517,6 +1517,10 @@ def _parse_compression_config(agent, _agent_cfg) -> CompressionSettings:
         codex_responses_native=responses_native,
         codex_responses_compact_threshold=compact_threshold,
         idle_compact_after_seconds=idle_compact_after_seconds,
+        # Opt-in stall suspend (default False MUST match DEFAULT_CONFIG): an over-threshold
+        # turn whose compression passes already proved ineffective (<5% cut → blocked flag)
+        # ends as soft compression_deferred instead of sending the oversized request.
+        suspend_on_stall=_cfg_flag(cfg, "suspend_on_stall", False),
     )
 
 
@@ -1902,6 +1906,7 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
     )
     agent.max_compression_attempts = cs.max_attempts
     agent.compression_idle_compact_after_seconds = cs.idle_compact_after_seconds
+    agent.compression_suspend_on_stall = cs.suspend_on_stall
 
 
 def _enforce_minimum_context(agent):
