@@ -1455,6 +1455,40 @@ class TestIsPaymentError:
         exc.status_code = 404
         assert _is_payment_error(exc) is False
 
+    def test_400_insufficient_credits_is_payment(self):
+        """The exact commandcode/GOAT shape: credit exhaustion returned as
+        HTTP 400 with an 'insufficient credits' body must classify so aux
+        lanes fall back and pool keys rotate."""
+        exc = Exception("Error code: 400 - {'detail': 'insufficient credits'}")
+        exc.status_code = 400
+        assert _is_payment_error(exc) is True
+
+    def test_400_context_length_is_not_payment(self):
+        exc = Exception("context length exceeded")
+        exc.status_code = 400
+        assert _is_payment_error(exc) is False
+
+    def test_400_generic_bad_request_is_not_payment(self):
+        exc = Exception("Bad Request")
+        exc.status_code = 400
+        assert _is_payment_error(exc) is False
+
+    def test_403_quota_exceeded_still_payment(self):
+        """Spot-check: widening the gate must not disturb the existing
+        403/404/429 keyword branch."""
+        exc = Exception("quota exceeded for this endpoint")
+        exc.status_code = 403
+        assert _is_payment_error(exc) is True
+
+    def test_400_billing_maps_to_payment_ladder_reason(self):
+        """First match in _FALLBACK_REASONS must read a 400 billing body as
+        'payment error' so the payment-fallback / pool-rotation rungs engage."""
+        from agent.auxiliary_client import _FALLBACK_REASONS
+        exc = Exception("insufficient credits")
+        exc.status_code = 400
+        reason = next(label for pred, label in _FALLBACK_REASONS if pred(exc))
+        assert reason == "payment error"
+
 
 
 
