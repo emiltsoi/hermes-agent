@@ -3482,10 +3482,29 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
         error_context: Dict[str, Any] = {"message": str(exc)}
         if status_code is not None:
             error_context["status_code"] = status_code
-        next_entry = pool.mark_exhausted_and_rotate(
-            status_code=status_code if status_code is not None else fallback_status,
-            error_context=error_context, api_key_hint=failed_api_key or None,
-        )
+        kwargs: Dict[str, Any] = {
+            "status_code": status_code if status_code is not None else fallback_status,
+            "error_context": error_context,
+            "api_key_hint": failed_api_key or None,
+        }
+        # Carry the classifier's verdict, mirroring the main rotation path. Without it the
+        # pool cannot size the cooldown by what actually failed (a billing 400 and an edge
+        # throttle both arrive as client errors), and a billing verdict is what lets
+        # _plan_refresh_until bench the key until its plan renews. Never let a
+        # classification miss block the rotation itself.
+        try:
+            from agent.error_classifier import FailoverReason, classify_api_error
+            verdict = classify_api_error(exc, provider=normalized)
+            reason = getattr(verdict, "reason", None)
+            if reason is not None:
+                failure_reason = reason.value
+                if reason == FailoverReason.billing and getattr(verdict, "billing_unverified", False):
+                    from agent.credential_pool import FAILURE_REASON_BILLING_UNVERIFIED
+                    failure_reason = FAILURE_REASON_BILLING_UNVERIFIED
+                kwargs["failure_reason"] = failure_reason
+        except Exception:
+            pass
+        next_entry = pool.mark_exhausted_and_rotate(**kwargs)
         if next_entry is None:
             return False
         _evict_cached_clients(normalized)
