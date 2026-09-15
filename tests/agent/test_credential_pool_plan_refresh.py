@@ -193,3 +193,63 @@ class TestPersistence:
         e.extra["failure_reason"] = FAILURE_REASON_BILLING
         assert e.extra.get(PLAN_REFRESH_KEY) == "monthly:20"
         assert e.extra.get("failure_reason") == FAILURE_REASON_BILLING
+
+
+class TestLateWindow:
+    """Exact sync to the renewal, without a month-long blackout.
+
+    A plan renews sometime DURING its day. If the bench expires at the renewal point and the
+    probe fails, benching a further full cycle would write the lane off for a month. The late
+    window instead retries on the short TTL until the renewal lands.
+    """
+
+    @staticmethod
+    def at(monkeypatch, dt):
+        import agent.credential_pool as cp
+        from datetime import timezone as _tz
+        monkeypatch.setattr(cp.time, "time", lambda: dt.replace(tzinfo=_tz.utc).timestamp())
+
+    def test_mid_cycle_benches_exactly_to_the_renewal(self, monkeypatch):
+        # dies 16-Sep; renewal day 20 -> bench to 20-Sep, NOT a day later
+        self.at(monkeypatch, datetime(2026, 9, 16, 5, 45))
+        got = _plan_refresh_until(entry(spec="monthly:20"))
+        assert got is not None
+        landed = datetime.fromtimestamp(got, timezone.utc)
+        assert (landed.month, landed.day, landed.hour) == (9, 20, 0)
+
+    def test_late_in_cycle_falls_back_to_the_short_ttl(self, monkeypatch):
+        # the probe just failed on renewal day -> do NOT bench another month
+        self.at(monkeypatch, datetime(2026, 9, 20, 0, 1))
+        assert _plan_refresh_until(entry(spec="monthly:20")) is None
+
+    def test_exact_boundary_counts_as_late(self, monkeypatch):
+        self.at(monkeypatch, datetime(2026, 9, 20, 0, 0, 0))
+        assert _plan_refresh_until(entry(spec="monthly:20")) is None
+
+    def test_after_the_late_window_it_benches_the_next_cycle(self, monkeypatch):
+        # >48h of failures after the renewal -> the plan did not renew
+        self.at(monkeypatch, datetime(2026, 9, 23, 8, 0))
+        got = _plan_refresh_until(entry(spec="monthly:20"))
+        assert got is not None
+        assert datetime.fromtimestamp(got, timezone.utc).month == 10
+
+    def test_daily_late_window_is_short(self, monkeypatch):
+        # daily cycle = 24h -> window is 2.4h; 3h after the reset we bench to the next one
+        self.at(monkeypatch, datetime(2026, 9, 17, 3, 0))
+        got = _plan_refresh_until(entry(spec="daily"))
+        assert got is not None
+        assert datetime.fromtimestamp(got, timezone.utc).day == 18
+
+    def test_daily_just_after_reset_is_late(self, monkeypatch):
+        self.at(monkeypatch, datetime(2026, 9, 17, 0, 1))
+        assert _plan_refresh_until(entry(spec="daily")) is None
+
+    def test_previous_helpers(self):
+        from agent.credential_pool import _plan_refresh_spec_previous
+        ts = datetime(2026, 9, 16, 5, 45, tzinfo=timezone.utc).timestamp()
+        prev = _plan_refresh_spec_previous("monthly:20", now=ts)
+        assert prev is not None
+        assert datetime.fromtimestamp(prev, timezone.utc).day == 20
+        assert datetime.fromtimestamp(prev, timezone.utc).month == 8
+        # absolute specs have no recurrence
+        assert _plan_refresh_spec_previous(str(ts - 10), now=ts) is None

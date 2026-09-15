@@ -153,6 +153,12 @@ PLAN_REFRESH_KEY = "plan_refresh"
 # months. Anything resolving beyond this falls back to the normal cooldown (and is
 # logged once per process, never per selection -- selection is a hot path).
 PLAN_BENCH_MAX_SECONDS = 35 * 24 * 60 * 60
+# Late window: how much of a cycle, after its renewal point, still counts as "the renewal
+# may simply be late today". Inside it we retry on the normal TTL instead of benching a
+# whole further cycle (see _plan_refresh_until). Capped at 48h so a short cycle (daily)
+# does not spend most of itself retrying.
+PLAN_LATE_WINDOW_MAX_SECONDS = 48 * 60 * 60
+PLAN_LATE_WINDOW_FRACTION = 0.10
 
 # Throttle window for the "no available entries" INFO line. Selection runs on
 # every model call; on Windows several processes share one rotating log behind
@@ -444,6 +450,56 @@ def _next_utc_monthly(now: float, day: int) -> float:
     return now + 28 * 24 * 60 * 60
 
 
+def _prev_utc_daily(now: float, hour: int, minute: int) -> float:
+    """Most recent occurrence of hour:minute UTC strictly before *now*."""
+    dt = datetime.fromtimestamp(now, timezone.utc)
+    target = dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    # INCLUSIVE: at exactly the occurrence, this cycle's renewal IS now, so a failure at
+    # this instant must read as "late in this cycle" (retry on the TTL) rather than as the
+    # previous month -- otherwise a probe landing exactly on the boundary benches a full
+    # further cycle.
+    if target > dt:
+        target -= timedelta(days=1)
+    return target.timestamp()
+
+
+def _prev_utc_monthly(now: float, day: int) -> float:
+    """Most recent occurrence of midnight UTC on day-of-month, strictly before *now*."""
+    day = max(1, min(28, day))
+    dt = datetime.fromtimestamp(now, timezone.utc)
+    for offset in (0, -1):
+        month_index = dt.month - 1 + offset
+        year = dt.year + month_index // 12
+        month = month_index % 12 + 1
+        candidate = dt.replace(year=year, month=month, day=day,
+                               hour=0, minute=0, second=0, microsecond=0)
+        if candidate <= dt:          # INCLUSIVE -- see _prev_utc_daily
+            return candidate.timestamp()
+    return now - 28 * 24 * 60 * 60
+
+
+def _plan_refresh_spec_previous(spec: Any, *, now: float) -> Optional[float]:
+    """Previous occurrence for a plan schedule spec, or None if it has none.
+
+    Absolute specs have no recurrence: once the moment has passed there is no "previous
+    cycle" to reason about, so the caller falls back to the normal cooldown.
+    """
+    if not isinstance(spec, str) or not spec.strip():
+        return None
+    raw = spec.strip()
+    match = _PLAN_DAILY_RE.match(raw)
+    if match:
+        hour = int(match.group(1) or 0)
+        minute = int(match.group(2) or 0)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return _prev_utc_daily(now, hour, minute)
+        return None
+    match = _PLAN_MONTHLY_RE.match(raw)
+    if match:
+        return _prev_utc_monthly(now, int(match.group(1)))
+    return None
+
+
 def _plan_refresh_spec_until(spec: Any, *, now: float) -> Optional[float]:
     """Next refresh epoch for a plan schedule spec, or None if unparseable."""
     if not isinstance(spec, str) or not spec.strip():
@@ -508,6 +564,19 @@ def _plan_refresh_until(entry: PooledCredential, *, sole_credential: bool = Fals
         return None
     if until <= now:
         return None
+    # Exact-sync guard: if we are already late in this cycle, we have served this cycle's
+    # bench and the key still failed -- so the renewal has not landed yet. Do not bench a
+    # further full cycle (that write-off is what once cost a month); retry on the short TTL
+    # and pick the plan up within the hour when it does renew.
+    try:
+        previous = _plan_refresh_spec_previous(spec, now=now)
+    except Exception:
+        previous = None
+    if previous is not None:
+        cycle = until - previous
+        late_window = min(PLAN_LATE_WINDOW_MAX_SECONDS, cycle * PLAN_LATE_WINDOW_FRACTION)
+        if now - previous <= late_window:
+            return None
     return until
 
 
