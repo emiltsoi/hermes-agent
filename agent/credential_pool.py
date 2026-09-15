@@ -13,7 +13,7 @@ import time
 import uuid
 import re
 from dataclasses import dataclass, fields, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -143,6 +143,17 @@ FAILURE_REASON_BILLING = "billing"
 # billing gets the short transient cooldown; genuine depletion re-latches.
 FAILURE_REASON_BILLING_UNVERIFIED = "billing_unverified"
 
+# --- Per-plan refresh schedule (fleet patch #22) --------------------------------
+# A dead-but-recurring plan key previously cost one wasted call per TTL window (~24/day
+# fleet-wide on 2026-09-15: P4 depleted, re-tested hourly, re-benched). When the plan's
+# refresh cycle is known we bench the key until it actually renews, then let the normal
+# selection re-test it once.
+PLAN_REFRESH_KEY = "plan_refresh"
+# Safety cap: a mis-set spec must not silently drop a healthy key from rotation for
+# months. Anything resolving beyond this falls back to the normal cooldown (and is
+# logged once per process, never per selection -- selection is a hot path).
+PLAN_BENCH_MAX_SECONDS = 35 * 24 * 60 * 60
+
 # Throttle window for the "no available entries" INFO line. Selection runs on
 # every model call; on Windows several processes share one rotating log behind
 # a cross-process lock, and per-selection logging stormed that lock, pegged a
@@ -173,6 +184,10 @@ _EXTRA_KEYS = frozenset({
     # raw status cannot size a cooldown; persisted so a restart doesn't downgrade
     # a billing bench to a 60s transient cooldown.
     "failure_reason",
+    # Per-plan refresh schedule (see _plan_refresh_until): an absolute timestamp or a
+    # recurrence ("daily", "daily@HH:MM", "monthly:D", UTC). Lets a billing-exhausted
+    # key bench until the plan renews instead of re-testing every TTL window.
+    "plan_refresh",
 })
 
 # Nous singleton metadata mirrored between auth.json state and ``entry.extra``.
@@ -394,12 +409,119 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
     return normalized
 
 
+_PLAN_DAILY_RE = re.compile(r"^daily(?:@(\d{1,2}):(\d{2}))?$", re.IGNORECASE)
+_PLAN_MONTHLY_RE = re.compile(r"^monthly:(\d{1,2})$", re.IGNORECASE)
+# Warn once per process, never per selection: selection runs on every model call and a
+# per-call log storms the shared rotating log behind its cross-process lock.
+_PLAN_SPEC_WARNED: Set[str] = set()
+
+
+def _next_utc_daily(now: float, hour: int, minute: int) -> float:
+    """Next occurrence of hour:minute UTC strictly after *now*."""
+    dt = datetime.fromtimestamp(now, timezone.utc)
+    target = dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if target <= dt:
+        target += timedelta(days=1)
+    return target.timestamp()
+
+
+def _next_utc_monthly(now: float, day: int) -> float:
+    """Next occurrence of midnight UTC on day-of-month, strictly after *now*.
+
+    Clamped to 1..28 so every month has the day -- a plan renewing on the 31st benches
+    a few days early, which costs one extra cheap re-test rather than a missed refresh.
+    """
+    day = max(1, min(28, day))
+    dt = datetime.fromtimestamp(now, timezone.utc)
+    for offset in (0, 1):
+        month_index = dt.month - 1 + offset
+        year = dt.year + month_index // 12
+        month = month_index % 12 + 1
+        candidate = dt.replace(year=year, month=month, day=day,
+                               hour=0, minute=0, second=0, microsecond=0)
+        if candidate > dt:
+            return candidate.timestamp()
+    return now + 28 * 24 * 60 * 60
+
+
+def _plan_refresh_spec_until(spec: Any, *, now: float) -> Optional[float]:
+    """Next refresh epoch for a plan schedule spec, or None if unparseable."""
+    if not isinstance(spec, str) or not spec.strip():
+        return None
+    raw = spec.strip()
+    absolute = _parse_absolute_timestamp(raw)
+    if absolute is not None:
+        return absolute
+    match = _PLAN_DAILY_RE.match(raw)
+    if match:
+        hour = int(match.group(1) or 0)
+        minute = int(match.group(2) or 0)
+        # Range-check here: the regex is deliberately loose, and dt.replace(hour=99)
+        # raises. A malformed spec must fall back to the TTL, never raise.
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return _next_utc_daily(now, hour, minute)
+        return None
+    match = _PLAN_MONTHLY_RE.match(raw)
+    if match:
+        return _next_utc_monthly(now, int(match.group(1)))
+    return None
+
+
+def _plan_refresh_until(entry: PooledCredential, *, sole_credential: bool = False) -> Optional[float]:
+    """Bench a BILLING-exhausted key until its plan's next refresh, if one is known.
+
+    Only VERIFIED billing qualifies. A transient throttle must keep its short TTL, and
+    ``billing_unverified`` may be a healthy credential (#82154). A sole credential never
+    benches on a schedule -- there is nothing to rotate to, so a long bench means hard
+    failures rather than a skipped retry.
+    """
+    if sole_credential:
+        return None
+    if entry.last_error_code != 402 and entry.failure_reason != FAILURE_REASON_BILLING:
+        return None
+    spec = (entry.extra or {}).get(PLAN_REFRESH_KEY)
+    if not spec:
+        return None
+    now = time.time()
+    try:
+        until = _plan_refresh_spec_until(spec, now=now)
+    except Exception:  # never let a schedule bug break credential selection
+        key = f"{entry.label or entry.id}:{spec}:error"
+        if key not in _PLAN_SPEC_WARNED:
+            _PLAN_SPEC_WARNED.add(key)
+            logger.warning(
+                "credential pool: plan_refresh %r for %s could not be evaluated -- "
+                "using the normal cooldown", spec, entry.label or entry.id[:8],
+            )
+        return None
+    if until is None:
+        return None
+    if until - now > PLAN_BENCH_MAX_SECONDS:
+        key = f"{entry.label or entry.id}:{spec}"
+        if key not in _PLAN_SPEC_WARNED:
+            _PLAN_SPEC_WARNED.add(key)
+            logger.warning(
+                "credential pool: %s plan_refresh %r resolves beyond the %d-day cap -- "
+                "using the normal cooldown instead",
+                entry.label or entry.id[:8], spec, PLAN_BENCH_MAX_SECONDS // 86400,
+            )
+        return None
+    if until <= now:
+        return None
+    return until
+
+
 def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) -> Optional[float]:
     if entry.last_status != STATUS_EXHAUSTED:
         return None
     reset_at = _parse_absolute_timestamp(entry.last_error_reset_at)
     if reset_at is not None:
         return reset_at
+    # We know this plan's refresh cycle (fleet patch #22): bench until it renews rather
+    # than re-testing the same dead key every TTL window.
+    plan_until = _plan_refresh_until(entry, sole_credential=sole_credential)
+    if plan_until is not None:
+        return plan_until
     if entry.last_status_at:
         return entry.last_status_at + _exhausted_ttl(
             entry.last_error_code,
