@@ -1559,19 +1559,40 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
 
 
 def _load_credential_pool(runtime: dict, job_id: str):
-    runtime_provider = str(runtime.get("provider") or "").strip().lower()
-    if not runtime_provider:
-        return None
-    try:
-        from agent.credential_pool import load_pool
-        pool = load_pool(runtime_provider)
-        if pool.has_credentials():
-            logger.info(
-                "Job '%s': loaded credential pool for provider %s with %d entries",
-                job_id, runtime_provider, len(pool.entries()))
-            return pool
-    except Exception as e:
-        logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
+    # Prefer the pool the resolver already selected and returned. Re-deriving it from
+    # runtime["provider"] silently loses it for named custom endpoints: the resolver
+    # normalizes them to "custom" while the pool stays keyed by its configured name, so
+    # load_pool() finds nothing and the job runs with NO rotation at all — one credential,
+    # then straight down the fallback chain. The resolver names its pick in "source"
+    # (e.g. "pool:goat-fleet").
+    resolver_pool = runtime.get("credential_pool")
+    if resolver_pool is not None:
+        try:
+            if resolver_pool.has_credentials():
+                logger.info(
+                    "Job '%s': using resolver-provided credential pool (%s) with %d entries",
+                    job_id, runtime.get("source") or "?", len(resolver_pool.entries()))
+                return resolver_pool
+        except Exception as e:
+            logger.debug("Job '%s': resolver-provided credential pool unusable: %s", job_id, e)
+
+    # Fall back to a direct lookup, trying the configured name before the normalized one.
+    for runtime_provider in (
+        str(runtime.get("requested_provider") or "").strip().lower(),
+        str(runtime.get("provider") or "").strip().lower(),
+    ):
+        if not runtime_provider:
+            continue
+        try:
+            from agent.credential_pool import load_pool
+            pool = load_pool(runtime_provider)
+            if pool.has_credentials():
+                logger.info(
+                    "Job '%s': loaded credential pool for provider %s with %d entries",
+                    job_id, runtime_provider, len(pool.entries()))
+                return pool
+        except Exception as e:
+            logger.debug("Job '%s': failed to load credential pool for %s: %s", job_id, runtime_provider, e)
     return None
 
 
