@@ -416,7 +416,7 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
 
 
 _PLAN_DAILY_RE = re.compile(r"^daily(?:@(\d{1,2}):(\d{2}))?$", re.IGNORECASE)
-_PLAN_MONTHLY_RE = re.compile(r"^monthly:(\d{1,2})$", re.IGNORECASE)
+_PLAN_MONTHLY_RE = re.compile(r"^monthly:(\d{1,2})(?:@(\d{1,2}):(\d{2}))?$", re.IGNORECASE)
 # Warn once per process, never per selection: selection runs on every model call and a
 # per-call log storms the shared rotating log behind its cross-process lock.
 _PLAN_SPEC_WARNED: Set[str] = set()
@@ -431,11 +431,15 @@ def _next_utc_daily(now: float, hour: int, minute: int) -> float:
     return target.timestamp()
 
 
-def _next_utc_monthly(now: float, day: int) -> float:
-    """Next occurrence of midnight UTC on day-of-month, strictly after *now*.
+def _next_utc_monthly(now: float, day: int, hour: int = 0, minute: int = 0) -> float:
+    """Next occurrence of day-of-month at hour:minute UTC, strictly after *now*.
 
     Clamped to 1..28 so every month has the day -- a plan renewing on the 31st benches
     a few days early, which costs one extra cheap re-test rather than a missed refresh.
+
+    hour/minute default to midnight UTC. NOT every provider renews at midnight: commandcode's
+    quota boundary is 05:00 UTC (13:00 HKT), so a midnight-only spec would release the key five
+    hours early -- a failed probe against a plan that has not come back yet.
     """
     day = max(1, min(28, day))
     dt = datetime.fromtimestamp(now, timezone.utc)
@@ -444,7 +448,7 @@ def _next_utc_monthly(now: float, day: int) -> float:
         year = dt.year + month_index // 12
         month = month_index % 12 + 1
         candidate = dt.replace(year=year, month=month, day=day,
-                               hour=0, minute=0, second=0, microsecond=0)
+                               hour=hour, minute=minute, second=0, microsecond=0)
         if candidate > dt:
             return candidate.timestamp()
     return now + 28 * 24 * 60 * 60
@@ -463,8 +467,8 @@ def _prev_utc_daily(now: float, hour: int, minute: int) -> float:
     return target.timestamp()
 
 
-def _prev_utc_monthly(now: float, day: int) -> float:
-    """Most recent occurrence of midnight UTC on day-of-month, strictly before *now*."""
+def _prev_utc_monthly(now: float, day: int, hour: int = 0, minute: int = 0) -> float:
+    """Most recent occurrence of day-of-month at hour:minute UTC, strictly before *now*."""
     day = max(1, min(28, day))
     dt = datetime.fromtimestamp(now, timezone.utc)
     for offset in (0, -1):
@@ -472,7 +476,7 @@ def _prev_utc_monthly(now: float, day: int) -> float:
         year = dt.year + month_index // 12
         month = month_index % 12 + 1
         candidate = dt.replace(year=year, month=month, day=day,
-                               hour=0, minute=0, second=0, microsecond=0)
+                               hour=hour, minute=minute, second=0, microsecond=0)
         if candidate <= dt:          # INCLUSIVE -- see _prev_utc_daily
             return candidate.timestamp()
     return now - 28 * 24 * 60 * 60
@@ -496,7 +500,11 @@ def _plan_refresh_spec_previous(spec: Any, *, now: float) -> Optional[float]:
         return None
     match = _PLAN_MONTHLY_RE.match(raw)
     if match:
-        return _prev_utc_monthly(now, int(match.group(1)))
+        hour = int(match.group(2) or 0)
+        minute = int(match.group(3) or 0)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return _prev_utc_monthly(now, int(match.group(1)), hour, minute)
+        return None
     return None
 
 
@@ -519,7 +527,13 @@ def _plan_refresh_spec_until(spec: Any, *, now: float) -> Optional[float]:
         return None
     match = _PLAN_MONTHLY_RE.match(raw)
     if match:
-        return _next_utc_monthly(now, int(match.group(1)))
+        hour = int(match.group(2) or 0)
+        minute = int(match.group(3) or 0)
+        # Range-check as the daily branch does: the regex is deliberately loose and
+        # dt.replace(hour=99) raises. A malformed spec must fall back to the TTL, never raise.
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return _next_utc_monthly(now, int(match.group(1)), hour, minute)
+        return None
     return None
 
 

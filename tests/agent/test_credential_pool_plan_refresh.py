@@ -253,3 +253,72 @@ class TestLateWindow:
         assert datetime.fromtimestamp(prev, timezone.utc).month == 8
         # absolute specs have no recurrence
         assert _plan_refresh_spec_previous(str(ts - 10), now=ts) is None
+
+class TestMonthlyWithTimeComponent:
+    """`monthly:D@HH:MM` -- because not every provider renews at midnight UTC.
+
+    commandcode's quota boundary is 05:00 UTC (13:00 HKT), so a midnight-only spec released
+    the key five hours early: a guaranteed failed probe against a plan that had not returned.
+    P1's real spec is ``monthly:19@05:00``.
+    """
+
+    def test_monthly_at_hhmm_lands_on_that_hour_utc(self):
+        # 06:15 HKT on the 19th is still the 18th in UTC -- the case that matters in practice.
+        dt = datetime(2026, 9, 18, 22, 15, tzinfo=timezone.utc)
+        got = _plan_refresh_spec_until("monthly:19@05:00", now=dt.timestamp())
+        assert got is not None
+        u = datetime.fromtimestamp(got, timezone.utc)
+        assert (u.day, u.hour, u.minute) == (19, 5, 0)
+        # and in HKT that is 13:00 -- the entire point of the change
+        hk = u.astimezone(timezone(timedelta(hours=8)))
+        assert (hk.day, hk.hour) == (19, 13)
+
+    def test_midnight_default_is_unchanged(self):
+        # backwards compatibility: a bare monthly:D still means midnight UTC
+        dt = datetime(2026, 9, 18, 22, 15, tzinfo=timezone.utc)
+        bare = _plan_refresh_spec_until("monthly:19", now=dt.timestamp())
+        explicit = _plan_refresh_spec_until("monthly:19@00:00", now=dt.timestamp())
+        assert bare == explicit
+        assert datetime.fromtimestamp(bare, timezone.utc).hour == 0
+
+    def test_same_day_before_the_time_still_counts(self):
+        dt = datetime(2026, 9, 19, 4, 0, tzinfo=timezone.utc)  # one hour before the boundary
+        got = _plan_refresh_spec_until("monthly:19@05:00", now=dt.timestamp())
+        u = datetime.fromtimestamp(got, timezone.utc)
+        assert (u.month, u.day, u.hour) == (9, 19, 5)
+
+    def test_rolls_to_next_month_once_the_time_has_passed(self):
+        dt = datetime(2026, 9, 19, 6, 0, tzinfo=timezone.utc)  # an hour AFTER the boundary
+        got = _plan_refresh_spec_until("monthly:19@05:00", now=dt.timestamp())
+        u = datetime.fromtimestamp(got, timezone.utc)
+        assert (u.month, u.day) == (10, 19)
+
+    def test_previous_occurrence_honours_the_time(self):
+        from agent.credential_pool import _plan_refresh_spec_previous
+        dt = datetime(2026, 9, 19, 9, 0, tzinfo=timezone.utc)  # after 05:00 on the 19th
+        got = _plan_refresh_spec_previous("monthly:19@05:00", now=dt.timestamp())
+        assert got is not None
+        u = datetime.fromtimestamp(got, timezone.utc)
+        assert (u.month, u.day, u.hour) == (9, 19, 5)
+
+    def test_day_still_clamped_to_28(self):
+        now = time.time()
+        got = _plan_refresh_spec_until("monthly:31@05:00", now=now)
+        assert got is not None
+        u = datetime.fromtimestamp(got, timezone.utc)
+        assert (u.day, u.hour) == (28, 5)
+
+    @pytest.mark.parametrize("bad", [
+        "monthly:19@99:00",     # hour out of range
+        "monthly:19@25:00",     # hour out of range, plausible-looking
+        "monthly:19@05:60",     # minute out of range
+        "monthly:19@5",         # minute is required, not optional
+        "monthly:19@05:00:00",  # seconds are not part of the grammar
+        "monthly:19@abc",
+    ])
+    def test_malformed_times_fall_back_and_never_raise(self, bad):
+        from agent.credential_pool import _plan_refresh_spec_previous
+        # A malformed schedule must degrade to the TTL path, not raise during credential
+        # selection -- dt.replace(hour=99) would raise if the range check were missing.
+        assert _plan_refresh_spec_until(bad, now=time.time()) is None
+        assert _plan_refresh_spec_previous(bad, now=time.time()) is None
