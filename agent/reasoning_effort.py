@@ -77,6 +77,15 @@ GLM53_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 DEEPSEEK_V4_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "max")
 DEEPSEEK_V4_OVERRIDES: dict[str, str] = {"xhigh": "max"}
 
+#: CommandCode ``/provider/v1`` — NARROWER than the generic OpenAI-compat set. It rejects
+#: ``none`` and ``minimal`` with HTTP 400 (live 2026-09-18, param=``reasoning_effort``):
+#:     Invalid option: expected one of "low"|"medium"|"high"|"xhigh"|"max"
+#: This matters more than a generic 400: the turn drops to the fallback lane, so a level this
+#: endpoint rejects silently relocates the request to a different provider (in the fleet's case,
+#: off the credential pool onto deepseek-direct). Any profile or custom endpoint fronting
+#: CommandCode must declare THIS set, not ``OPENAI_COMPAT_WIRE_EFFORTS``.
+COMMANDCODE_EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
 #: Ollama Cloud /v1/chat/completions: rejects ``minimal`` with HTTP 400.
 OLLAMA_CLOUD_EFFORTS: tuple[str, ...] = ("none", "low", "medium", "high", "max")
 OLLAMA_CLOUD_OVERRIDES: dict[str, str] = {"xhigh": "max"}
