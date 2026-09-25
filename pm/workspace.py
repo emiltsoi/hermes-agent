@@ -283,6 +283,14 @@ def _workspace_member(plugin_dir: Path, root: Path, *, identity: Path) -> Path:
                 changed = True
         if virtual:
             document.setdefault("project", {})["name"] = f"hermes-plugin-{key}"
+            # A synthesized [project] table must be PEP 621-valid, or `uv lock` refuses the
+            # WHOLE workspace rather than just this member ("the required project.version
+            # field is neither set nor present in the project.dynamic list"). A metadata-only
+            # plugin such as hermes-lcm declares no [project] at all — its pyproject exists
+            # only to pin lint settings — so the table created just above carries a name and
+            # nothing else. Manifest-only members already write both fields; match them.
+            # setdefault, not assignment: a member that declared its own version keeps it.
+            document["project"].setdefault("version", "0.0.0")
         if virtual or changed:
             import tomli_w
 
