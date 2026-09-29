@@ -353,6 +353,30 @@ def _git_env(
     return env
 
 
+def _git_subprocess(cmd, env, timeout, cwd=None):
+    """Single seam over ``subprocess.run`` for every git invocation.
+
+    Kept as a named helper (rather than inlined) so callers and tests stub one
+    function instead of the stdlib. NUL-delimited output (``-z``) carries literal
+    filenames and must NOT be text-decoded; every other call decodes UTF-8 with
+    replacement so a stray byte in git's output cannot raise.
+    """
+    text_options = {} if "-z" in cmd else {"text": True, "encoding": "utf-8", "errors": "replace"}
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        **text_options,
+        timeout=timeout,
+        env=env,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        # Checkpoints fire several bare git calls per turn from the console-less
+        # desktop/gateway backend; suppress the per-call conhost flash on Windows
+        # (no-op on POSIX).
+        creationflags=windows_hide_flags(),
+    )
+
+
 def _run_git(
     args: List[str],
     store: Path,
@@ -390,21 +414,7 @@ def _run_git(
     result = None
     for _attempt in range(2):  # one retry at most, after removing a provably stale lock
         try:
-            # NUL-delimited git output contains literal filenames, not text lines.
-            text_options = {} if "-z" in args else {"text": True, "encoding": "utf-8", "errors": "replace"}
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                **text_options,
-                timeout=timeout,
-                env=env,
-                cwd=str(normalized_working_dir),
-                stdin=subprocess.DEVNULL,
-                # Checkpoints fire several bare git calls per turn from the
-                # console-less desktop/gateway backend; suppress the per-call
-                # conhost flash on Windows (no-op on POSIX).
-                creationflags=windows_hide_flags(),
-            )
+            result = _git_subprocess(cmd, env, timeout, cwd=str(normalized_working_dir))
         except subprocess.TimeoutExpired:
             # FLEET PATCH: a killed git leaves its index lock behind; nothing else ever
             # removes it, and every later call then fails rc=128 in milliseconds forever.
@@ -437,7 +447,14 @@ def _run_git(
                 match = re.search(r"Unable to create '([^']+\.lock)'", _err_txt)
                 lock = Path(str(index_file) + ".lock")
                 if match and match.group(1) == str(lock):
-                    age = _mtime_or_none(lock)
+                    # Latent NameError fixed during the 2026-09-29 rebase: this helper used to
+                    # live in THIS module, but upstream moved it to tools/file_state.py (with a
+                    # str signature). Stat inline rather than coupling to an underscore-private
+                    # helper across modules.
+                    try:
+                        age = lock.stat().st_mtime
+                    except OSError:
+                        age = None
                     if age is not None and time.time() - age >= _STALE_LOCK_AGE_S:
                         _unlink_quiet(lock)
                         logger.warning("Removed stale index lock %s (age %ss) — retrying once: %s",
