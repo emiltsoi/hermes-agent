@@ -369,6 +369,30 @@ def _git_env(
     return env
 
 
+def _git_subprocess(cmd, env, timeout, cwd=None):
+    """Single seam over ``subprocess.run`` for every git invocation.
+
+    Kept as a named helper (rather than inlined) so callers and tests stub one
+    function instead of the stdlib. NUL-delimited output (``-z``) carries literal
+    filenames and must NOT be text-decoded; every other call decodes UTF-8 with
+    replacement so a stray byte in git's output cannot raise.
+    """
+    text_options = {} if "-z" in cmd else {"text": True, "encoding": "utf-8", "errors": "replace"}
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        **text_options,
+        timeout=timeout,
+        env=env,
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        # Checkpoints fire several bare git calls per turn from the console-less
+        # desktop/gateway backend; suppress the per-call conhost flash on Windows
+        # (no-op on POSIX).
+        creationflags=windows_hide_flags(),
+    )
+
+
 def _run_git(
     args: list[str],
     store: Path,
