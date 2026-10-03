@@ -559,13 +559,13 @@ def _refresh_exclude(store: Path) -> None:
     exclude_path = store / "info" / "exclude"
     marker = store / _EXCLUDE_MARKER_NAME
     try:
-        current = marker.read_text(encoding="utf-8").strip()
+        current = marker.read_text(encoding="utf-8-sig").strip()
     except OSError:
         current = ""
     if current == want and exclude_path.exists():
         return
     try:
-        existing = exclude_path.read_text(encoding="utf-8").splitlines() if exclude_path.exists() else []
+        existing = exclude_path.read_text(encoding="utf-8-sig").splitlines() if exclude_path.exists() else []
         present = {line.strip() for line in existing}
         additions = [entry for entry in DEFAULT_EXCLUDES if entry.strip() not in present]
         if additions:
