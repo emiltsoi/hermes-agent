@@ -2001,18 +2001,26 @@ def _retarget_active_profile(old: str, new: str, message: str) -> None:
 
 def get_active_profile_name() -> str:
     """Profile name inferred from HERMES_HOME: ``"default"`` when unset or ``~/.hermes``, the
-    name under ``~/.hermes/profiles/<name>``, ``"custom"`` for any other path."""
+    name under ``~/.hermes/profiles/<name>``, ``"custom"`` for any other path.
+
+    Symlink-at-entry profiles (external-volume storage layout, D13 2026-10-09): the profile dir
+    ``~/.hermes/profiles/<name>`` may itself be a symlink to another volume — ``resolve()`` on
+    such a home escapes ``profiles/`` and the old single resolved check returned ``"custom"``,
+    a wrong name that left the cron ticker serving the wrong store. The LOGICAL path is tried
+    first (it still carries the name); resolution stays as the fallback for symlinked roots.
+    """
     from hermes_constants import get_hermes_home
-    resolved = get_hermes_home().resolve()
-    if resolved == _get_default_hermes_home().resolve():
+    home = Path(get_hermes_home())
+    if home.resolve() == _get_default_hermes_home().resolve():
         return "default"
-    profiles_root = _get_profiles_root().resolve()
-    try:
-        parts = resolved.relative_to(profiles_root).parts
-        if len(parts) == 1 and _PROFILE_ID_RE.match(parts[0]):
-            return parts[0]
-    except ValueError:
-        pass
+    profiles_root = _get_profiles_root()
+    for candidate, root in ((home, profiles_root), (home.resolve(), profiles_root.resolve())):
+        try:
+            parts = candidate.relative_to(root).parts
+            if len(parts) == 1 and _PROFILE_ID_RE.match(parts[0]):
+                return parts[0]
+        except ValueError:
+            continue
     return "custom"
 
 
