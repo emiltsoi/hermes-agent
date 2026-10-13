@@ -425,6 +425,7 @@ def _run_git(
     if git is None:
         return False, "", "git is not installed or not on PATH"
     cmd = [git, *args]
+    allowed_returncodes = allowed_returncodes or set()
 
     for _attempt in range(2):  # one retry at most, after removing a provably stale lock
         try:
