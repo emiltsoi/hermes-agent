@@ -380,6 +380,7 @@ def _git_subprocess(cmd, env, timeout, cwd=None):
     text_options = {} if "-z" in cmd else {"text": True, "encoding": "utf-8", "errors": "replace"}
     return subprocess.run(
         cmd,
+        check=False,  # lint (PLW1510): explicit; semantics unchanged (check defaults to False)
         capture_output=True,
         **text_options,
         timeout=timeout,
@@ -1491,6 +1492,14 @@ class CheckpointManager:
                 hermes_home = Path.home() / ".hermes"
                 try:
                     if check == hermes_home or hermes_home in check.parents:
+                        return str(candidate)
+                    # 2026-10-14 (mac floor): a SEAT ROOT — /Volumes/External/fleet/profiles/<name>
+                    # or its ~/.hermes/profiles/<name> symlink view — carries multi-GB state/lcm
+                    # DBs. A checkpoint `git add -A` there is guaranteed-degenerate: measured on
+                    # zero's own seat, 60s timeouts every ~75s, each blocking a live tool call.
+                    # Refuse the seat-root class exactly like ~/.hermes (caller falls back to the
+                    # candidate itself — no marker, no project).
+                    if re.search(r"/(\.hermes|fleet)/profiles/[^/]+/?$", str(check)):
                         return str(candidate)
                 except OSError:
                     pass
