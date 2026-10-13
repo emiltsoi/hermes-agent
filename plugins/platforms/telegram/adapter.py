@@ -221,6 +221,23 @@ def _coerce_duration_seconds(value: Any) -> Optional[int]:
     return secs if secs > 0 else None
 
 
+def _coerce_message_id(value: Any) -> Optional[int]:
+    """Telegram message ids are ints; anything else means "do not thread".
+
+    A reply anchor can come from a source whose ids are NOT Telegram ids: a mesh-injected message
+    carries a UUID as its ``message_id``. ``int()`` on that used to raise inside the send path and
+    fail the ENTIRE message — every send tied to that turn failed and retried. Dropping the anchor
+    is the correct behaviour: you cannot thread a Telegram reply to a foreign id, and not threading
+    is an ordinary send. (2026-09-26, found by yoyo: her home-channel sends failed 11 times.)
+    """
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _probe_voice_duration_seconds(path: str) -> Optional[int]:
     """Best-effort whole-second audio length (wave → mutagen → ffprobe; None if unreadable).
 
@@ -1006,7 +1023,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     @classmethod
     def _metadata_reply_to_message_id(cls, metadata: Optional[dict[str, Any]]) -> Optional[int]:
         reply_to = (metadata or {}).get("telegram_reply_to_message_id")
-        return int(reply_to) if reply_to is not None else None
+        return _coerce_message_id(reply_to)
 
     @staticmethod
     def _dm_topic_fallback(metadata: Optional[dict[str, Any]]) -> bool:
@@ -1029,7 +1046,7 @@ class TelegramAdapter(TelegramHeldInboundMixin, BasePlatformAdapter):
     def _reply_to_message_id_for_send(
         cls, reply_to: Optional[str], metadata: Optional[dict[str, Any]] = None, reply_to_mode: Optional[str] = None) -> Optional[int]:
         if reply_to:
-            return int(reply_to)
+            return _coerce_message_id(reply_to)
         if cls._dm_topic_fallback(metadata) and reply_to_mode != "off":
             return cls._metadata_reply_to_message_id(metadata)
         return None
