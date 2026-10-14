@@ -166,6 +166,17 @@ DEFAULT_EXCLUDES = [
 
 # Git subprocess timeout (seconds).
 _GIT_TIMEOUT: int = max(10, min(60, env_int("HERMES_CHECKPOINT_TIMEOUT", 30)))
+
+# 2026-10-14 (mac floor): a live SEAT ROOT -- …/profiles/<name> via .hermes or the external
+# fleet volume -- carries multi-GB state/lcm DBs; recording it as a checkpoint project makes
+# every file-mutating call eat a 60s `git add -A` timeout. The resolution walk can LEGALLY
+# return the seat as the candidate (a root-level file write's nearest dir), so the refusal
+# must sit at take-time (ensure_checkpoint + _take), not only in the walk guard.
+_SEAT_ROOT_RE = re.compile(r"/(\.hermes|fleet)/profiles/[^/]+/?$")
+
+
+def _is_seat_root_dir(path) -> bool:
+    return bool(_SEAT_ROOT_RE.search(str(path)))
 _STALE_LOCK_AGE_S = 180  # a measured index lock older than this is ours, not a live git's
 _EXCLUDE_MARKER_NAME = ".exclude_rev"  # store-root marker: sha256 of the DEFAULT_EXCLUDES revision
 # Inherited GIT_* vars that would redirect the shadow store's git calls.
@@ -1002,6 +1013,10 @@ class CheckpointManager:
 
         abs_dir = str(_normalize_path(working_dir))
 
+        if _is_seat_root_dir(abs_dir):
+            logger.debug("Checkpoint skipped: seat-root workdir (%s)", abs_dir)
+            return False
+
         # Skip root, home, and other overly broad directories
         if abs_dir in {"/", str(Path.home())}:
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
@@ -1514,6 +1529,9 @@ class CheckpointManager:
 
     def _take(self, working_dir: str, reason: str, *, prune: bool = True) -> bool:
         """Take a snapshot.  Returns True on success."""
+        if _is_seat_root_dir(working_dir):
+            logger.debug("Checkpoint skipped at take: seat-root workdir (%s)", working_dir)
+            return False
         store = _store_path()
 
         err = _init_store(store, working_dir)
