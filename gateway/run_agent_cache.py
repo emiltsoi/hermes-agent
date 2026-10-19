@@ -117,13 +117,30 @@ class GatewayAgentCacheMixin:
         threads trade prompt-cache warmth for correct memory attribution.
         """
         import hashlib, json as _j
-        # Fingerprint the FULL credential, not a short prefix: OAuth/JWT-style tokens often share a
-        # common prefix (e.g. "eyJhbGci"), so a prefix would give false cache hits across auth switches.
+        # Fingerprint the credential SOURCE, not the credential the pool happened to select this
+        # turn. A round_robin pool rotates the selected key on every resolution without changing
+        # the agent's config; hashing that key silently rebuilt the agent (and re-initialized every
+        # memory provider, resetting Hindsight's retain window) on every turn. Pool identity is its
+        # membership — sorted entry ids — so add/remove still busts the cache while rotation does
+        # not. Without a pool, keep the FULL-key digest: OAuth/JWT-style tokens often share a common
+        # prefix (e.g. "eyJhbGci"), so a prefix would give false cache hits across auth switches.
         _api_key = str(runtime.get("api_key", "") or "")
+        _pool = runtime.get("credential_pool")
+        if _pool is not None:
+            try:
+                _credential_identity = "pool:" + ",".join(
+                    sorted(str(entry.id) for entry in _pool.entries()))
+            except Exception:
+                # Degraded state: the pool's membership is unreadable, so fall back to its
+                # provider identity instead of failing the signature. Membership changes are
+                # not detectable here; a healthy pool never takes this branch.
+                _credential_identity = "pool:" + str(getattr(_pool, "provider", "") or "")
+        else:
+            _credential_identity = hashlib.sha256(_api_key.encode()).hexdigest() if _api_key else ""
         blob = _j.dumps(
             [
                 model,
-                hashlib.sha256(_api_key.encode()).hexdigest() if _api_key else "",
+                _credential_identity,
                 runtime.get("base_url", ""), runtime.get("provider", ""),
                 runtime.get("requested_provider", ""), runtime.get("api_mode", ""),
                 sorted((runtime.get("capabilities") or {}).items()),
