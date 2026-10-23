@@ -7,6 +7,7 @@ import contextvars as _ctxvars
 import logging
 import threading
 from contextlib import suppress
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -221,12 +222,68 @@ def _background_review_read_before_write_guard(
         _read_before_write_required=True)
 
 
-def _background_review_preflight(action: str, name: str) -> Optional[dict[str, Any]]:
-    if action != "delete":
+_EXTERNAL_WRITE_ACTIONS = frozenset({"patch", "edit", "write_file", "remove_file"})
+
+
+def _background_review_external_write_guard(name: str, action: str) -> Optional[dict[str, Any]]:
+    """Refuse unattended writes into an external skills root (`skills.external_dirs`, e.g. fleet/shared).
+
+    Why this exists (2026-10-23, Emil-directed): the delete guard below deliberately does not gate
+    content writes, on the premise that "every write is ledgered and reversible". That premise holds
+    for a per-seat skill and fails for a SHARED one: a shared skill edit is LIVE for every seat the
+    moment it lands on disk, because skill loading reads the filesystem — the commit is not the
+    deployment boundary for a skill, the write is. So a shared write is *recoverable*, not
+    reversible, and only by whoever notices. Measured fleet context: 123 curator writes landed in
+    fleet/shared over 8 days with no owner in the loop.
+
+    A wife's pen promotes; an unattended fork does not. The refusal names the draft location so the
+    proposal is not silently lost.
+    """
+    if action not in _EXTERNAL_WRITE_ACTIONS or not _is_background_review():
         return None
+    try:
+        from tools import skill_manager_tool as _smt
+
+        existing = _smt._find_skill(name)
+        if not existing:
+            return None
+        skill_dir = existing["path"]
+        from agent.skill_utils import is_external_skill_path
+
+        if not is_external_skill_path(skill_dir):
+            return None
+    except Exception:
+        logger.debug("external write guard lookup failed for %s", name, exc_info=True)
+        return None
+
+    draft_hint = ""
+    try:
+        drafts = Path(skill_dir).parent / ".curator_drafts"
+        drafts.mkdir(parents=True, exist_ok=True)
+        log = drafts / "PROPOSALS.log"
+        with log.open("a", encoding="utf-8") as fh:
+            fh.write(f"{datetime.now().isoformat(timespec='seconds')}\t{action}\t{name}\t"
+                     f"refused-external-write\n")
+        draft_hint = f" The attempt was recorded in {log}."
+    except Exception:
+        logger.debug("could not record curator draft proposal for %s", name, exc_info=True)
+
+    return _refusal(
+        f"Refusing background curator {action} for skill '{name}': it lives in "
+        f"skills.external_dirs ({skill_dir}), which no unattended writer may change — a shared "
+        f"skill edit is live for every seat as soon as it is written, not when it is committed. "
+        f"A wife's pen promotes changes here: raise the proposal to the skill's owning seat "
+        f"instead.{draft_hint}")
+
+
+def _background_review_preflight(action: str, name: str) -> Optional[dict[str, Any]]:
     from tools import skill_manager_tool as _smt
     existing = _smt._find_skill(name)
-    return _background_review_delete_guard(name, existing["path"]) if existing else None
+    if not existing:
+        return None
+    if action == "delete":
+        return _background_review_delete_guard(name, existing["path"])
+    return _background_review_external_write_guard(name, action)
 
 
 def _curator_consolidation_delete_guard(
