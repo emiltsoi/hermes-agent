@@ -102,6 +102,50 @@ def carry_callback(event, rewritten):
 _PREFIX_PRODUCERS = ('webhook', 'api_server', 'msgraph_webhook')
 
 
+# Fleet carry: a plugin adapter may declare it delivers events stamped as other
+# platforms; the plugin probes this name before stamping. Revert deletes the
+# whole capability.
+ROUTED_PLATFORM_BINDING = True
+
+
+def _routed_deliverer(runner, source, profile, adapter, registries):
+    """Adapter that handed us *source* when it is not the stamped platform's own.
+
+    Returns *adapter* for a direct event (no ref / ref to the resolved adapter /
+    no restore hint), the delivering adapter for a DECLARED routed event, or
+    None to refuse — the caller turns None into the same ``not_found`` an
+    undeclared foreign stamp gets today.
+    """
+    from gateway.config import Platform
+    ref = getattr(source, '_transport_adapter_ref', None)
+    delivering = ref() if callable(ref) else None
+    if delivering is None:
+        # Restore path: provenance re-seeds the claim (the weakref does not
+        # serialize); from_dict-built sources arrive with only the hint.
+        hint = getattr(source, '_delivering_platform', None)
+        if not hint:
+            return adapter
+        try:
+            hinted = Platform(hint)
+        except Exception:
+            # Forged or garbled hint names no platform: refuse like any other
+            # unresolvable stamp instead of escaping as a ValueError.
+            return None
+        delivering = (dict(registries).get(profile) or {}).get(hinted)
+    if delivering is None or delivering is adapter:
+        return adapter
+    if source.platform is Platform.RELAY:
+        return None  # relay provenance is seal-bound (_relay_connector), never declarable
+    declared = getattr(delivering, 'delivers_as_platforms', None)
+    registered, owner = runner._owning_profile(delivering, getattr(delivering, 'platform', None))
+    if (not registered or owner != profile
+            or sum(item is delivering for _, m in registries for item in m.values()) != 1
+            or not isinstance(declared, (set, frozenset, list, tuple))
+            or source.platform not in declared):
+        return None
+    return delivering
+
+
 def _runtime_profile(runner, source, profile, owner_name, homes, relay):
     """The multiplexed runtime profile *source* routes to; ``_binding`` checks it is served."""
     # Same matcher as ingress stamping, ``user_id`` included: a ``user_id`` route stamps the
@@ -137,6 +181,11 @@ def _binding(runner, source, profile):
     candidates = [(owner, mapping.get(platform)) for owner, mapping in registries]
     adapter = next((adapter for owner, adapter in candidates if owner == profile), None)
     if adapter is None or sum(item is adapter for _, item in candidates) != 1:
+        raise RuntimeStoreError('not_found')
+    direct = adapter
+    adapter = _routed_deliverer(runner, source, profile, adapter, registries)
+    # A foreign stamp re-binds to the declaring deliverer — or dies identically.
+    if adapter is None:
         raise RuntimeStoreError('not_found')
     home = getattr(runner, '_native_transport_homes', {}).get(profile)
     if home is None or not home.is_dir():
@@ -195,6 +244,8 @@ def _binding(runner, source, profile):
                   'platform': source.platform.value, 'connector': connector}
     if multiplex:
         provenance['transport_profile'] = profile
+    if adapter is not direct:
+        provenance['delivering_platform'] = adapter.platform.value
     if relay:
         provenance['relay'] = _relay_seal(transport, source, provenance)
     return adapter, home, runtime_home, provenance
@@ -212,6 +263,10 @@ def capture_provenance(runner, event):
         owner = (adapter, context[3])
     else:
         owner = runner._transport_owner(event.source)
+        if (owner is None or owner[0] is not adapter) and 'delivering_platform' in provenance:
+            # Routed: _binding already proved the deliverer's same-profile
+            # registration; the owner tuple just restates it.
+            owner = (adapter, context[3])
     if owner is None or owner[0] is not adapter or home != context[2]:
         raise RuntimeStoreError('not_found')
     return provenance
@@ -223,6 +278,7 @@ def restore_provenance(runner, source, provenance):
         raise RuntimeStoreError('invalid_params')
     candidate = copy(source)
     candidate.delivered_via_upstream_relay = 'relay' in provenance
+    candidate._delivering_platform = provenance.get('delivering_platform')
     adapter, home, runtime_home, expected = _binding(runner, candidate, provenance.get('transport_profile'))
     if provenance != expected:
         raise RuntimeStoreError('profile_mismatch')
