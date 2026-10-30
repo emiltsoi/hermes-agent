@@ -272,3 +272,55 @@ def test_routed_source_derives_the_target_platform_session_key(tmp_path):
     mesh_key = build_session_key(unstamped)
     assert ":mesh:" in mesh_key, mesh_key
     assert mesh_key != key
+
+
+def test_stamped_platform_served_by_another_profile_is_refused(tmp_path):
+    """GATE-LINDA C1, in the shape it can actually occur: the stamped platform is
+    served by the PROCESS (primary registry) but NOT by the profile the event is
+    admitted under.
+
+    The pre-existing same-profile resolution (``_binding`` :181-184) refuses before
+    any declaration is consulted, so a routed exemption cannot widen a profile's
+    authority to mint sessions for a platform it does not itself serve. The second
+    half is the control: give that profile its own adapter and the same event binds
+    — so the refusal is the profile scoping, not a broken fixture.
+    """
+    mesh, telegram = _mesh(), _Adapter(Platform.TELEGRAM, token="tg-cred")
+    runner = _runner(tmp_path, {Platform.TELEGRAM: telegram},
+                     profile_adapters={"britney": {MESH: mesh}})
+    register_transport_home(runner, "britney", tmp_path)
+
+    refused = _refused(runner, _event(_routed_source(mesh)), tmp_path, profile="britney")
+    assert refused.reason == "not_found"
+
+    brit_tg = _Adapter(Platform.TELEGRAM, token="tg-cred")
+    runner._profile_adapters["britney"] = {MESH: mesh, Platform.TELEGRAM: brit_tg}
+    provenance = _capture(runner, _event(_routed_source(mesh)), tmp_path, profile="britney")
+    assert provenance["delivering_platform"] == "mesh"
+    assert provenance["platform"] == "telegram"
+
+
+def test_a_grant_is_counted_not_only_recorded(tmp_path, caplog):
+    """GATE-LINDA C2: the exemption must be countable, not a grep of a provenance dict.
+
+    One machine-parseable line per granted rebind, with a fixed token, so
+    ``grep -c routed-delivery`` is the number. Direct traffic emits none.
+    """
+    import logging
+
+    mesh, telegram = _mesh(), _Adapter(Platform.TELEGRAM, token="tg-cred")
+    runner = _runner(tmp_path, {Platform.TELEGRAM: telegram, MESH: mesh})
+
+    with caplog.at_level(logging.INFO, logger="gateway.session_ingress_context"):
+        caplog.clear()
+        _capture(runner, _event(_routed_source(mesh)), tmp_path)
+        granted = [r for r in caplog.records if "routed-delivery" in r.getMessage()]
+        assert len(granted) == 1, [r.getMessage() for r in granted]
+        assert "platform=mesh" in granted[0].getMessage()
+        assert "stamped=telegram" in granted[0].getMessage()
+
+        caplog.clear()
+        direct = telegram.build_source(
+            chat_id="7945905361", chat_type="dm", user_id="7945905361", user_name="emil")
+        _capture(runner, _event(direct), tmp_path)
+        assert [r for r in caplog.records if "routed-delivery" in r.getMessage()] == []

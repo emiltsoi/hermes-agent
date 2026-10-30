@@ -3,12 +3,15 @@ from contextlib import contextmanager
 from copy import copy
 from contextvars import ContextVar
 from pathlib import Path
+import json
+import logging
 import weakref
 import hashlib
 import hmac
-import json
 
 from hermes_state_runtime import RuntimeStoreError
+
+logger = logging.getLogger(__name__)
 
 _callback: ContextVar[tuple | None] = ContextVar('native_ingress_callback', default=None)
 _relay_callback: ContextVar[tuple | None] = ContextVar('relay_ingress_callback', default=None)
@@ -143,6 +146,12 @@ def _routed_deliverer(runner, source, profile, adapter, registries):
             or not isinstance(declared, (set, frozenset, list, tuple))
             or source.platform not in declared):
         return None
+    logger.info(
+        "routed-delivery granted platform=%s stamped=%s profile=%s",
+        getattr(delivering.platform, 'value', delivering.platform),
+        getattr(source.platform, 'value', source.platform),
+        profile,
+    )
     return delivering
 
 
