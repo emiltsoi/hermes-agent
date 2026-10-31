@@ -430,3 +430,26 @@ def test_owner_mismatch_refusal_is_named_and_counted(tmp_path, caplog):
     assert "reason=owner-mismatch" in lines[0]
     assert "delivering_profile=beta" in lines[0]
     assert "admitting_profile=alpha" in lines[0]
+
+
+def test_unregistered_deliverer_has_its_own_token(tmp_path, caplog):
+    """Linda's note: one token covering two causes is a count with an ambiguous population.
+
+    ``not registered`` and ``owner != profile`` are different diagnoses — an adapter that never
+    reached a registry is not a cross-profile event — so they carry different tokens.
+    """
+    import logging
+
+    mesh, telegram = _mesh(), _Adapter(Platform.TELEGRAM, token="tg-cred")
+    runner = _runner(tmp_path, {Platform.TELEGRAM: telegram, MESH: mesh})
+    runner.adapters.pop(MESH, None)          # the deliverer was never registered
+
+    with caplog.at_level(logging.WARNING, logger="gateway.session_ingress_context"):
+        caplog.clear()
+        refused = _refused(runner, _event(_routed_source(mesh)), tmp_path)
+
+    assert refused.reason == "not_found"
+    lines = [r.getMessage() for r in caplog.records if "routed-delivery refused" in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert "reason=deliverer-not-registered" in lines[0]
+    assert "owner-mismatch" not in lines[0]

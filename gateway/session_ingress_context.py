@@ -141,11 +141,19 @@ def _routed_deliverer(runner, source, profile, adapter, registries):
         return None  # relay provenance is seal-bound (_relay_connector), never declarable
     declared = getattr(delivering, 'delivers_as_platforms', None)
     registered, owner = runner._owning_profile(delivering, getattr(delivering, 'platform', None))
-    if not registered or owner != profile:
-        # A deliverer registered under a DIFFERENT profile is refused, and says so by name. Closed
-        # silently this was correct and invisible: a multiplex operator with one credential serving
-        # several routed runtimes would meet it as a refusal with no reason attached. The token is
-        # countable (grep -c) and both profiles are named, so the next reader is told what to prove.
+    if not registered:
+        # Refused, and says which refusal. Two causes, two tokens: a count whose population is
+        # ambiguous is the same defect as a silence, one level down — an operator must be able to
+        # tell a cross-profile event from an adapter that never registered.
+        logger.warning(
+            "routed-delivery refused reason=deliverer-not-registered platform=%s admitting_profile=%s",
+            getattr(getattr(delivering, 'platform', None), 'value', None), profile)
+        return None
+    if owner != profile:
+        # A deliverer registered under a DIFFERENT profile. Closed silently this was correct and
+        # invisible: a multiplex operator with one credential serving several routed runtimes would
+        # meet it as a refusal with no reason attached. Both profiles are named, so the next reader
+        # is told what to prove rather than discovering it through a wrong allowlist decision.
         logger.warning(
             "routed-delivery refused reason=owner-mismatch delivering_profile=%s admitting_profile=%s",
             owner, profile)
