@@ -405,3 +405,28 @@ def test_dead_transport_ref_without_a_hint_is_refused_not_widened(tmp_path):
     refused = _refused(runner, _event(source), tmp_path)
     assert refused.reason == "not_found", (
         f"expected capture_provenance to refuse an unnameable transport, saw {refused.reason!r}")
+
+
+def test_owner_mismatch_refusal_is_named_and_counted(tmp_path, caplog):
+    """Linda's addendum: the refusal existed, but it was silent.
+
+    Refusing is correct; refusing without a name or a number leaves a multiplex operator holding a
+    bare not_found. The token is countable and both profiles are named, matching the grant line.
+    """
+    import logging
+
+    mesh, telegram = _mesh(), _Adapter(Platform.TELEGRAM, token="tg-cred")
+    runner = _runner(tmp_path, {},
+                     profile_adapters={"alpha": {Platform.TELEGRAM: telegram},
+                                       "beta": {MESH: mesh}})
+
+    with caplog.at_level(logging.WARNING, logger="gateway.session_ingress_context"):
+        caplog.clear()
+        refused = _refused(runner, _event(_routed_source(mesh)), tmp_path, profile="alpha")
+
+    assert refused.reason == "not_found"
+    lines = [r.getMessage() for r in caplog.records if "routed-delivery refused" in r.getMessage()]
+    assert len(lines) == 1, lines
+    assert "reason=owner-mismatch" in lines[0]
+    assert "delivering_profile=beta" in lines[0]
+    assert "admitting_profile=alpha" in lines[0]

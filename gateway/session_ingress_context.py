@@ -141,8 +141,16 @@ def _routed_deliverer(runner, source, profile, adapter, registries):
         return None  # relay provenance is seal-bound (_relay_connector), never declarable
     declared = getattr(delivering, 'delivers_as_platforms', None)
     registered, owner = runner._owning_profile(delivering, getattr(delivering, 'platform', None))
-    if (not registered or owner != profile
-            or sum(item is delivering for _, m in registries for item in m.values()) != 1
+    if not registered or owner != profile:
+        # A deliverer registered under a DIFFERENT profile is refused, and says so by name. Closed
+        # silently this was correct and invisible: a multiplex operator with one credential serving
+        # several routed runtimes would meet it as a refusal with no reason attached. The token is
+        # countable (grep -c) and both profiles are named, so the next reader is told what to prove.
+        logger.warning(
+            "routed-delivery refused reason=owner-mismatch delivering_profile=%s admitting_profile=%s",
+            owner, profile)
+        return None
+    if (sum(item is delivering for _, m in registries for item in m.values()) != 1
             or not isinstance(declared, (set, frozenset, list, tuple))
             or source.platform not in declared):
         return None
