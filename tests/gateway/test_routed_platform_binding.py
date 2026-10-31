@@ -324,3 +324,24 @@ def test_a_grant_is_counted_not_only_recorded(tmp_path, caplog):
             chat_id="7945905361", chat_type="dm", user_id="7945905361", user_name="emil")
         _capture(runner, _event(direct), tmp_path)
         assert [r for r in caplog.records if "routed-delivery" in r.getMessage()] == []
+
+
+def test_stamped_platform_registered_in_two_registries_is_refused(tmp_path):
+    """Mutation M7: the SAME adapter object for the stamped platform in two registries.
+
+    The pre-existing resolution refuses when the stamped platform's adapter is
+    ambiguous across the primary map and a profile map. No test in this file pinned
+    that for the STAMPED platform (only for the deliverer), so deleting the
+    uniqueness term from :183 left the suite green — a mutation that survived.
+    This test exists because that mutation was found, not because it was imagined.
+    """
+    mesh, telegram = _mesh(), _Adapter(Platform.TELEGRAM, token="tg-cred")
+    runner = _runner(tmp_path, {Platform.TELEGRAM: telegram, MESH: mesh},
+                     profile_adapters={"other": {Platform.TELEGRAM: telegram}})
+
+    refused = _refused(runner, _event(_routed_source(mesh)), tmp_path)
+    assert refused.reason == "not_found"
+
+    # control: drop the duplicate registration and the identical event binds
+    runner._profile_adapters["other"] = {}
+    assert _capture(runner, _event(_routed_source(mesh)), tmp_path)["platform"] == "telegram"
