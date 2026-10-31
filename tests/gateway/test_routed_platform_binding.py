@@ -345,3 +345,63 @@ def test_stamped_platform_registered_in_two_registries_is_refused(tmp_path):
     # control: drop the duplicate registration and the identical event binds
     runner._profile_adapters["other"] = {}
     assert _capture(runner, _event(_routed_source(mesh)), tmp_path)["platform"] == "telegram"
+
+
+def test_authorization_resolves_the_stamped_platform_not_the_deliverer(tmp_path):
+    """Britney's finding: 0 tests referenced authorization at all.
+
+    The security keystone is that ``_chat_scoped_grant`` asks for
+    ``authorization_is_upstream`` on the STAMPED platform (:563 -> ``_adapter_flag(source.platform)``),
+    so a routed turn still obeys the target platform's policy. Swap the platform for the deliverer's
+    and this assertion flips: the turn would inherit mesh's upstream waiver while stamped telegram.
+    """
+    class _WaivingMesh(_Adapter):
+        """``authorization_is_upstream`` is a read-only property on the base adapter — it must be
+        overridden, not assigned, which is also how the real MeshAdapter declares it."""
+
+        @property
+        def authorization_is_upstream(self):
+            return True
+
+    mesh = _WaivingMesh(MESH, token="mesh-cred")
+    mesh.delivers_as_platforms = (Platform.TELEGRAM,)
+    telegram = _Adapter(Platform.TELEGRAM, token="tg-cred")
+    runner = _runner(tmp_path, {Platform.TELEGRAM: telegram, MESH: mesh})
+
+    routed = _routed_source(mesh)              # stamped telegram, delivered by mesh
+    assert runner._chat_scoped_grant(routed, None, False, True) is False, (
+        "authorization followed the DELIVERER, not the stamp — a routed turn would inherit mesh's "
+        "upstream waiver instead of telegram's policy")
+
+    # control: the same adapter on its OWN platform still waives, so the fixture is sound
+    direct = mesh.build_source(chat_id="1", chat_type="dm", user_id="1", user_name="x")
+    assert runner._chat_scoped_grant(direct, None, False, True) is True
+
+
+def test_the_capability_sentinel_exists_and_is_true():
+    """Britney: 0 references to the sentinel anywhere. The plugin probes it at import to decide the
+    stamp; rename or drop it and the fleet silently falls back to mesh-keyed sessions."""
+    from gateway.session_ingress_context import ROUTED_PLATFORM_BINDING
+
+    assert ROUTED_PLATFORM_BINDING is True, (
+        "the sentinel the plugin probes is missing or false — routed delivery would silently degrade")
+
+
+def test_dead_transport_ref_without_a_hint_is_refused_not_widened(tmp_path):
+    """Britney's edge: a source whose transport weakref died and which carries no
+    ``delivering_platform`` hint.
+
+    ``_routed_deliverer`` sees ``delivering is None`` and returns the STAMPED platform's adapter, so
+    binding alone would look like a routed event that had quietly become a direct one. The provenance
+    check is what must still refuse — an event whose transport cannot be named is not an event we can
+    bind, and returning a live adapter is not the same as admitting it.
+    """
+    mesh, telegram = _mesh(), _Adapter(Platform.TELEGRAM, token="tg-cred")
+    runner = _runner(tmp_path, {Platform.TELEGRAM: telegram, MESH: mesh})
+
+    source = _routed_source(mesh)
+    source._transport_adapter_ref = lambda: None      # the deliverer is gone
+
+    refused = _refused(runner, _event(source), tmp_path)
+    assert refused.reason == "not_found", (
+        f"expected capture_provenance to refuse an unnameable transport, saw {refused.reason!r}")
