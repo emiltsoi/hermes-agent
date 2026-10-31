@@ -162,12 +162,21 @@ def _routed_deliverer(runner, source, profile, adapter, registries):
             or not isinstance(declared, (set, frozenset, list, tuple))
             or source.platform not in declared):
         return None
-    logger.info(
-        "routed-delivery granted platform=%s stamped=%s profile=%s",
-        getattr(delivering.platform, 'value', delivering.platform),
-        getattr(source.platform, 'value', source.platform),
-        profile,
-    )
+    # Logged ONCE per source, not once per consultation. ``_binding`` is invoked several times for a
+    # single event (prepare, capture, restore), so an unguarded line counts consultations — measured 9
+    # for one delivered message on the first live traffic — and a count that inflates by a variable
+    # factor is the same defect as a silence. The attribute rides the source object.
+    if not getattr(source, '_routed_grant_logged', False):
+        try:
+            source._routed_grant_logged = True
+        except AttributeError:
+            pass
+        logger.info(
+            "routed-delivery granted platform=%s stamped=%s profile=%s",
+            getattr(delivering.platform, 'value', delivering.platform),
+            getattr(source.platform, 'value', source.platform),
+            profile,
+        )
     return delivering
 
 

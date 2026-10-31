@@ -453,3 +453,25 @@ def test_unregistered_deliverer_has_its_own_token(tmp_path, caplog):
     assert len(lines) == 1, lines
     assert "reason=deliverer-not-registered" in lines[0]
     assert "owner-mismatch" not in lines[0]
+
+
+def test_grant_is_logged_once_per_source_not_per_consultation(tmp_path, caplog):
+    """Found on the first live traffic: 9 grant lines for ONE delivered message.
+
+    ``_binding`` runs several times per event (prepare, capture, restore), so an unguarded line
+    counts consultations, not deliveries — a count that inflates by a variable factor. The token
+    must mean "deliveries that took the exemption", so it fires once per source object.
+    """
+    import logging
+
+    mesh, telegram = _mesh(), _Adapter(Platform.TELEGRAM, token="tg-cred")
+    runner = _runner(tmp_path, {Platform.TELEGRAM: telegram, MESH: mesh})
+    source = _routed_source(mesh)
+
+    with caplog.at_level(logging.INFO, logger="gateway.session_ingress_context"):
+        caplog.clear()
+        for _ in range(4):                     # the same event consulted repeatedly
+            _capture(runner, _event(source), tmp_path)
+        granted = [r for r in caplog.records if "routed-delivery granted" in r.getMessage()]
+
+    assert len(granted) == 1, f"one delivery produced {len(granted)} grant lines"
